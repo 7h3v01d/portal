@@ -109,10 +109,52 @@ def test_trusted_row_device_id_is_recomputed_from_key(tmp_path: Path):
     peer = _peer("Dad-PC")
     store = FileIdentityStore(tmp_path)
     store.trust(peer)
-    # Tamper the stored id; the loaded id must still match the key.
     import json
     rows = json.loads((tmp_path / "trusted.json").read_text())
     rows[0]["device_id"] = "FFFF-FFFF-FFFF-FFFF"
     (tmp_path / "trusted.json").write_text(json.dumps(rows))
     loaded = FileIdentityStore(tmp_path).list_trusted()[0]
     assert loaded.device_id == device_id_for(peer.public_key)
+
+
+@pytest.mark.parametrize("junk", ["123", "null", "true", '"a string"', "{}"])
+def test_non_list_trusted_json_fails_closed(tmp_path: Path, junk):
+    # Valid JSON that isn't a list is corruption -> trust nobody, never raise.
+    (tmp_path / "trusted.json").write_text(junk)
+    assert FileIdentityStore(tmp_path).list_trusted() == []
+
+
+@pytest.mark.parametrize("junk", ["123", "null", "true", '"a string"', "[]"])
+def test_corrupt_device_json_falls_back_to_default(tmp_path: Path, junk):
+    store = FileIdentityStore(tmp_path)
+    store.load_or_create("Dad-PC")  # writes a valid device.json
+    (tmp_path / "device.json").write_text(junk)
+    # Reload: corrupt device.json must not raise; name falls back to the arg.
+    ident = FileIdentityStore(tmp_path).load_or_create("Fallback-Name")
+    assert ident.identity.device_name == "Fallback-Name"
+
+
+def test_shared_lock_prevents_cross_instance_resurrection(tmp_path: Path):
+    # The reviewer's reproduction: two store objects on the same directory must
+    # share a lock so a concurrent revoke isn't lost.
+    import threading
+
+    a = FileIdentityStore(tmp_path)
+    b = FileIdentityStore(tmp_path)
+    dad = _peer("Dad")
+    a.trust(dad)
+    extra = [_peer(f"d{i}") for i in range(40)]
+
+    def add_many():
+        for p in extra:
+            b.trust(p)
+
+    def revoke_dad():
+        a.revoke(dad.public_key)
+
+    t1 = threading.Thread(target=add_many)
+    t2 = threading.Thread(target=revoke_dad)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    assert not a.is_trusted(dad)  # revoke not lost
+    assert all(a.is_trusted(p) for p in extra)

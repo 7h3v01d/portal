@@ -101,16 +101,28 @@ rate-limited**, binding trust to the transport-**authenticated** key, pinned onl
 after a **Short Authentication String** ceremony.
 
 **Gate 2A — host trust establishment: CLOSED.** **Gate 2B — mutual end-to-end
-pairing: CLOSED** (PAIR_REQUEST → PAIR_ACCEPT/DENY exercised through the codec,
-both installations pin each other).
+pairing: CLOSED** (PAIR_REQUEST → PAIR_ACCEPT → PAIR_CONFIRM through the codec).
+
+The SAS is **80 bits** (grouped hex): an active MITM that chooses the keys it
+presents cannot grind them to force both legs to a matching SAS — a shorter
+(~20-bit) SAS was demonstrably ground to a collision in seconds. Trust is
+committed with explicit **pending → commit** semantics bound by a transaction
+nonce: the controller commits first; the host — the side that will grant control
+of the machine — commits only on the final PAIR_CONFIRM, so a dropped/declined
+last step leaves the host *under*-trusting, never over-trusting.
+
+**Known LAN limitation (documented, revisited in Phase 3):** a single global
+attempt counter means an untrusted peer can force EXHAUSTED and annoy a
+legitimate pairing attempt — a nuisance DoS, not a trust compromise (posture
+stays fail-closed). When the real listener lands in Phase 3, add source/connection
+throttling and pairing-mode DoS handling.
 
 **SAS invariant (non-negotiable, esp. for the internet phases):** pairing
 approval means the SAS shown on this machine was compared *out of band* against
-the SAS on the other physical machine and matched. Both machines derive the same
-SAS from both public keys, so an active MITM (its own key on each leg) produces
-different strings on each side and the comparison fails. The `confirm` callback
-is that ceremony; the UI that implements it is bound by this invariant and must
-be tested at the UI boundary.
+the SAS on the other physical machine and matched. The `confirm` callback is that
+ceremony; the UI is bound by this invariant. For internet pairing, use an
+established PAKE (SPAKE2+/OPAQUE) so the one-time code becomes a real secret
+rather than plaintext in transit — not a home-grown protocol.
 
 ### Phase 3 — LAN file transfer *(0.1.0 — first shippable)*
 The first genuinely useful build. TLS-over-TCP transport + chunked transfer:

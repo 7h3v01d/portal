@@ -53,10 +53,13 @@ def test_happy_path_pins_authenticated_key(tmp_path):
     code = mgr.begin_pairing()
     key = a_key()
     r = mgr.handle_request(key, code, "Leon-PC", confirm=YES)
-    assert r.outcome is PairingOutcome.ACCEPTED
+    assert r.outcome is PairingOutcome.PENDING_COMMIT
     assert r.peer.public_key == key
     assert r.peer.device_id == device_id_for(key)
-    assert store.is_trusted(r.peer)
+    assert not store.is_trusted(r.peer)  # not until commit
+    committed = mgr.commit(r.nonce)
+    assert committed.outcome is PairingOutcome.ACCEPTED
+    assert store.is_trusted(committed.peer)
 
 
 def test_single_use(tmp_path):
@@ -114,20 +117,50 @@ def test_malformed_peer_key_never_trusted(tmp_path):
     assert store.list_trusted() == []
 
 
-# --- SAS / MITM detection -------------------------------------------------
-def test_sas_is_order_independent_and_matches_for_same_pair():
+# --- SAS strength / MITM detection ----------------------------------------
+def test_sas_is_order_independent():
     a, b = a_key("A"), a_key("B")
     assert compute_sas(a, b) == compute_sas(b, a)
 
 
-def test_sas_differs_under_mitm():
-    controller, hostk, attacker = a_key("c"), a_key("h"), a_key("m")
-    # No MITM: both sides share the same pair -> identical SAS.
-    assert compute_sas(controller, hostk) == compute_sas(hostk, controller)
-    # MITM terminates each leg with its own key -> the two sides differ.
-    controller_side = compute_sas(controller, attacker)
-    host_side = compute_sas(attacker, hostk)
-    assert controller_side != host_side
+def test_sas_is_at_least_80_bits():
+    # 80 bits = 20 hex chars, rendered in groups of 4.
+    import secrets
+
+    sas = compute_sas(secrets.token_bytes(32), secrets.token_bytes(32))
+    hex_only = sas.replace("-", "")
+    assert len(hex_only) == 20  # 80 bits
+    assert all(c in "0123456789ABCDEF" for c in hex_only)
+
+
+def test_sas_space_has_no_collisions_over_many_pairs():
+    # This test FAILS on the old 20-bit SAS (birthday collision well before 5000
+    # pairs) and passes on 80-bit. Uses raw 32-byte values, no keygen, for speed.
+    import secrets
+
+    seen = set()
+    for _ in range(5000):
+        sas = compute_sas(secrets.token_bytes(32), secrets.token_bytes(32))
+        assert sas not in seen
+        seen.add(sas)
+
+
+def test_sas_resists_key_grinding_attack():
+    # The reviewer's exact attack: an active MITM fixes its controller-side key,
+    # reads the controller SAS, then grinds a host-side key until the host SAS
+    # matches. At 80 bits a bounded search finds nothing.
+    import secrets
+
+    controller = a_key("C")
+    host_k = a_key("H")
+    attacker_ctrl_side = a_key("M1")
+    target = compute_sas(controller, attacker_ctrl_side)
+
+    for _ in range(200_000):
+        candidate = secrets.token_bytes(32)
+        if compute_sas(candidate, host_k) == target:
+            raise AssertionError("SAS collision found — entropy too low")
+    # No collision in 200k tries (would be near-certain at 20 bits).
 
 
 # --- controller side + mutual pairing -------------------------------------

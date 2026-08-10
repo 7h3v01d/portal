@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -40,21 +41,45 @@ from .identity import DeviceIdentity, Ed25519Identity, IdentityStore, verify_pin
 
 _log = get_logger("security.store")
 
+# Locks are shared by RESOLVED storage directory, not by store instance — two
+# FileIdentityStore objects pointing at the same directory in one process must
+# serialise against each other, or a concurrent trust()/revoke() can resurrect
+# revoked trust. (Cross-process locking via a filesystem lock is a documented
+# follow-up for when Portal runs as a service.)
+_DIR_LOCKS_GUARD = threading.Lock()
+_DIR_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _lock_for(resolved_dir: str) -> threading.RLock:
+    with _DIR_LOCKS_GUARD:
+        lock = _DIR_LOCKS.get(resolved_dir)
+        if lock is None:
+            lock = threading.RLock()
+            _DIR_LOCKS[resolved_dir] = lock
+        return lock
+
 
 def _atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    # Unique temp file in the same directory, then atomic replace. A unique name
+    # (not a fixed .tmp) is safe even if multiple writers ever coexist.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
-    finally:
         try:
-            os.chmod(tmp, mode)  # best-effort; no-op-ish on Windows
+            os.chmod(tmp, mode)  # best-effort; limited on Windows
         except OSError:
             pass
-    os.replace(tmp, path)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class FileIdentityStore(IdentityStore):
@@ -65,11 +90,9 @@ class FileIdentityStore(IdentityStore):
         self._key_path = self._dir / "identity.pem"
         self._device_path = self._dir / "device.json"
         self._trusted_path = self._dir / "trusted.json"
-        # Serialises read-modify-write of the trust store and identity creation
-        # within a process. Atomic replace prevents torn files; this prevents a
-        # concurrent trust()/revoke() from clobbering each other and resurrecting
-        # revoked trust. (Cross-process locking is a documented follow-up.)
-        self._lock = threading.RLock()
+        # Shared by resolved directory so all instances for the same store
+        # serialise their read-modify-write against each other.
+        self._lock = _lock_for(str(self._dir.resolve()))
 
     # --- this device's identity ------------------------------------------
     def load_or_create(self, device_name: str) -> Ed25519Identity:
@@ -115,8 +138,21 @@ class FileIdentityStore(IdentityStore):
 
     def _load_device_name(self, default: str) -> str:
         try:
-            return json.loads(self._device_path.read_text("utf-8"))["device_name"]
-        except (OSError, ValueError, KeyError):
+            doc = json.loads(self._device_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return default
+        # Must be an object with a string device_name that passes the display-text
+        # gate; anything else (corruption/tampering) falls back to the default.
+        if not isinstance(doc, dict):
+            return default
+        name = doc.get("device_name")
+        if not isinstance(name, str) or not name:
+            return default
+        try:
+            from .validation import ensure_display_text
+
+            return ensure_display_text(name)[:64]
+        except Exception:
             return default
 
     def _save_device_name(self, device_name: str) -> None:
@@ -131,6 +167,12 @@ class FileIdentityStore(IdentityStore):
         try:
             rows = json.loads(self._trusted_path.read_text("utf-8"))
         except (OSError, ValueError):
+            return []
+        # Fail closed: a corrupted/tampered trust database means trust nobody,
+        # not raise. Valid JSON that isn't a list (123, null, true, "x") is
+        # exactly such corruption.
+        if not isinstance(rows, list):
+            _log.warning("trusted.json is not a list; treating as empty (trust nobody)")
             return []
         out: list[DeviceIdentity] = []
         for row in rows:

@@ -57,6 +57,7 @@ class MessageType(str, Enum):
     PAIR_REQUEST = "pair_request"
     PAIR_ACCEPT = "pair_accept"
     PAIR_DENY = "pair_deny"
+    PAIR_CONFIRM = "pair_confirm"
 
     # Session lifecycle
     SESSION_REQUEST = "session_request"
@@ -164,6 +165,7 @@ class PairRequestPayload(BaseModel):
 class PairAcceptPayload(BaseModel):
     model_config = _WIRE
     device_name: str = Field(min_length=1, max_length=MAX_DEVICE_NAME_LEN)
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")  # transaction nonce to echo in PAIR_CONFIRM
 
     @field_validator("device_name")
     @classmethod
@@ -175,6 +177,11 @@ class PairAcceptPayload(BaseModel):
             return ensure_display_text(v)
         except UnsafePathError as exc:
             raise ValueError(str(exc)) from exc
+
+
+class PairConfirmPayload(BaseModel):
+    model_config = _WIRE
+    nonce: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class PairDenyPayload(BaseModel):
@@ -201,6 +208,7 @@ PAYLOAD_SCHEMAS: dict[MessageType, type[BaseModel]] = {
     MessageType.PAIR_REQUEST: PairRequestPayload,
     MessageType.PAIR_ACCEPT: PairAcceptPayload,
     MessageType.PAIR_DENY: PairDenyPayload,
+    MessageType.PAIR_CONFIRM: PairConfirmPayload,
     MessageType.SESSION_REQUEST: SessionRequestPayload,
     MessageType.CAPABILITY_REQUEST: CapabilityChangePayload,
     MessageType.CAPABILITY_GRANT: CapabilityChangePayload,

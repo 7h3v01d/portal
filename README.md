@@ -8,10 +8,11 @@ yourself.
 
 ## Status
 
-**Phase 0 + 0.1 — Foundation, adversarially hardened (0.0.1).** Architecture,
-protocol core, security model, and the five replaceable interfaces are in place,
-through Phase 2 (identity + mutual pairing), with three adversarial passes folded
-in. 129 tests green. Gate 1 closed; Gate 2A + 2B closed. No screen capture, no networking, no input injection yet — see
+**Phase 2.2 — Identity & mutual pairing, adversarially hardened (0.0.2).**
+Architecture, protocol core, security model, the five replaceable interfaces,
+on-disk identity, and grind-resistant mutual pairing are in place, with four
+adversarial passes folded in. 143 tests green. Gate 1 closed; Gate 2A + 2B
+closed. No screen capture, networking, or input injection yet — see
 [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Design principle
