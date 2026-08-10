@@ -5,6 +5,5 @@ setlocal
 call .venv\Scripts\activate.bat
 if errorlevel 1 exit /b 1
 
-python -m pytest -v
-pause
+python -m pytest -q
 exit /b %errorlevel%
