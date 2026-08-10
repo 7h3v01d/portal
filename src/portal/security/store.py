@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -64,23 +65,29 @@ class FileIdentityStore(IdentityStore):
         self._key_path = self._dir / "identity.pem"
         self._device_path = self._dir / "device.json"
         self._trusted_path = self._dir / "trusted.json"
+        # Serialises read-modify-write of the trust store and identity creation
+        # within a process. Atomic replace prevents torn files; this prevents a
+        # concurrent trust()/revoke() from clobbering each other and resurrecting
+        # revoked trust. (Cross-process locking is a documented follow-up.)
+        self._lock = threading.RLock()
 
     # --- this device's identity ------------------------------------------
     def load_or_create(self, device_name: str) -> Ed25519Identity:
-        if self._key_path.exists():
-            private = self._load_private_key()
-            name = self._load_device_name(default=device_name)
-            return Ed25519Identity(private, name)
+        with self._lock:
+            if self._key_path.exists():
+                private = self._load_private_key()
+                name = self._load_device_name(default=device_name)
+                return Ed25519Identity(private, name)
 
-        identity = Ed25519Identity.generate(device_name)
-        self._save_private_key(identity)
-        self._save_device_name(device_name)
-        if self._passphrase is None:
-            _log.warning(
-                "device private key written without a passphrase; enable "
-                "passphrase or OS-native protection before real deployment"
-            )
-        return identity
+            identity = Ed25519Identity.generate(device_name)
+            self._save_private_key(identity)
+            self._save_device_name(device_name)
+            if self._passphrase is None:
+                _log.warning(
+                    "device private key written without a passphrase; enable "
+                    "passphrase or OS-native protection before real deployment"
+                )
+            return identity
 
     def _load_private_key(self) -> Ed25519PrivateKey:
         data = self._key_path.read_bytes()
@@ -128,14 +135,16 @@ class FileIdentityStore(IdentityStore):
         out: list[DeviceIdentity] = []
         for row in rows:
             try:
+                public_key = bytes.fromhex(row["public_key"])
+                # Public key is authoritative: derive the id from it rather than
+                # trusting the stored device_id, and reject any row whose key is
+                # not canonical 32-byte material (DeviceIdentity validates length).
                 out.append(
-                    DeviceIdentity(
-                        device_id=row["device_id"],
-                        device_name=row["device_name"],
-                        public_key=bytes.fromhex(row["public_key"]),
+                    DeviceIdentity.from_public_key(
+                        public_key, device_name=str(row.get("device_name", ""))
                     )
                 )
-            except (KeyError, ValueError, TypeError):
+            except (KeyError, ValueError, TypeError, IdentityError):
                 continue  # skip malformed rows rather than trusting them
         return out
 
@@ -154,15 +163,17 @@ class FileIdentityStore(IdentityStore):
         )
 
     def trust(self, peer: DeviceIdentity) -> None:
-        peers = self._load_trusted()
-        if any(verify_pinned(peer.public_key, existing) for existing in peers):
-            return  # already trusted (idempotent, keyed on full key)
-        peers.append(peer)
-        self._save_trusted(peers)
+        with self._lock:
+            peers = self._load_trusted()
+            if any(verify_pinned(peer.public_key, existing) for existing in peers):
+                return  # already trusted (idempotent, keyed on full key)
+            peers.append(peer)
+            self._save_trusted(peers)
 
     def revoke(self, public_key: bytes) -> None:
-        peers = [p for p in self._load_trusted() if not verify_pinned(public_key, p)]
-        self._save_trusted(peers)
+        with self._lock:
+            peers = [p for p in self._load_trusted() if not verify_pinned(public_key, p)]
+            self._save_trusted(peers)
 
     def is_trusted(self, peer: DeviceIdentity) -> bool:
         return any(verify_pinned(peer.public_key, existing) for existing in self._load_trusted())

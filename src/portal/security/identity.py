@@ -48,11 +48,25 @@ def device_id_for(public_key: bytes) -> str:
 
 @dataclass(frozen=True)
 class DeviceIdentity:
-    """The public half of a device's identity — safe to share and display."""
+    """The public half of a device's identity — safe to share and display.
+
+    The public key is authoritative and is validated as canonical 32-byte
+    Ed25519 material at construction, so no path (pairing, store load, wire) can
+    ever produce or persist an identity backed by a malformed key."""
 
     device_id: str
     device_name: str
     public_key: bytes  # raw 32-byte Ed25519 public key — the authoritative identity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.public_key, (bytes, bytearray)):
+            raise IdentityError(
+                f"public_key must be bytes, got {type(self.public_key).__name__}"
+            )
+        if len(self.public_key) != _ED25519_PUBLIC_LEN:
+            raise IdentityError(
+                f"public_key must be {_ED25519_PUBLIC_LEN} bytes, got {len(self.public_key)}"
+            )
 
     def fingerprint(self) -> str:
         """Full SHA-256 of the public key, for the 'is this really Dad's PC?'
@@ -62,11 +76,16 @@ class DeviceIdentity:
     @classmethod
     def from_public_key(cls, public_key: bytes, device_name: str) -> "DeviceIdentity":
         """Build a peer identity from its authenticated public key, deriving the
-        id locally. The name is an untrusted display hint supplied by the peer."""
+        id locally. Rejects anything that is not a 32-byte key (via __post_init__).
+        The name is an untrusted display hint supplied by the peer."""
+        if not isinstance(public_key, (bytes, bytearray)):
+            raise IdentityError(
+                f"public_key must be bytes, got {type(public_key).__name__}"
+            )
         return cls(
-            device_id=_device_id_from_public_key(public_key),
+            device_id=_device_id_from_public_key(bytes(public_key)),
             device_name=device_name,
-            public_key=public_key,
+            public_key=bytes(public_key),
         )
 
 

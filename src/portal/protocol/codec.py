@@ -157,6 +157,13 @@ def decode(raw: bytes) -> Message:
     ProtocolError. This function is the trust boundary — every exit is a
     ProtocolError subclass, never a bare TypeError/RecursionError."""
 
+    # 0. Input must be bytes-like. decode() is the trust boundary and promises
+    #    every exit is a ProtocolError — so a non-bytes argument is a clean
+    #    DecodeError, not an escaping TypeError.
+    if not isinstance(raw, (bytes, bytearray)):
+        raise DecodeError(f"decode expects bytes, got {type(raw).__name__}")
+    raw = bytes(raw)
+
     # 1. Size ceiling — before parsing.
     if len(raw) > MAX_CONTROL_MESSAGE_BYTES:
         raise MessageTooLargeError(

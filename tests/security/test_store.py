@@ -91,3 +91,28 @@ def test_malformed_trusted_rows_are_skipped_not_trusted(tmp_path: Path):
     (tmp_path / "trusted.json").write_text('[{"device_id": "x"}, "junk", 123]')
     store = FileIdentityStore(tmp_path)
     assert store.list_trusted() == []
+
+
+def test_trusted_row_with_non_32_byte_key_is_skipped(tmp_path: Path):
+    # Finding 3, persistence side: a stored key that is not canonical Ed25519
+    # material must not load as a trusted identity.
+    (tmp_path / "trusted.json").write_text(
+        '[{"device_id": "AAAA-AAAA-AAAA-AAAA", "device_name": "x", "public_key": "00"}]'
+    )
+    assert FileIdentityStore(tmp_path).list_trusted() == []
+
+
+def test_trusted_row_device_id_is_recomputed_from_key(tmp_path: Path):
+    # The stored device_id is not trusted; it is derived from the key on load.
+    from portal.security.identity import device_id_for
+
+    peer = _peer("Dad-PC")
+    store = FileIdentityStore(tmp_path)
+    store.trust(peer)
+    # Tamper the stored id; the loaded id must still match the key.
+    import json
+    rows = json.loads((tmp_path / "trusted.json").read_text())
+    rows[0]["device_id"] = "FFFF-FFFF-FFFF-FFFF"
+    (tmp_path / "trusted.json").write_text(json.dumps(rows))
+    loaded = FileIdentityStore(tmp_path).list_trusted()[0]
+    assert loaded.device_id == device_id_for(peer.public_key)

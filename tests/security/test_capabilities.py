@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Leon Priest (github.com/7h3v01d)
-"""Authority model: deny-first, no mutable-set bypass, capability-bound tokens."""
+"""Authority model: deny-first, no mutable-set bypass, capability-bound tokens
+with INDEPENDENT per-capability cancellation domains."""
 
 from __future__ import annotations
 
@@ -12,27 +13,18 @@ from portal.security.authority import SessionAuthority
 from portal.security.permissions import PermissionGate
 
 
-def test_new_set_grants_nothing():
-    caps = CapabilitySet()
-    assert all(not caps.has(c) for c in Capability)
-
-
-def test_authority_deny_first_and_grant_isolated():
+def test_new_authority_grants_nothing():
     auth = SessionAuthority()
-    assert not auth.has(Capability.SCREEN_PUBLISH)
-    auth.grant(Capability.SCREEN_PUBLISH)
-    assert auth.has(Capability.SCREEN_PUBLISH)
-    assert not auth.has(Capability.INPUT_INJECT_MOUSE)
+    assert all(not auth.has(c) for c in Capability)
 
 
 def test_no_mutable_capability_set_exposed():
-    # The Phase 0.2 bypass: there must be no public mutable capabilities handle.
     auth = SessionAuthority()
     assert not hasattr(auth, "capabilities")
     assert isinstance(auth.granted(), frozenset)
 
 
-def test_authorize_token_valid_until_capability_revoked():
+def test_token_valid_until_its_capability_revoked():
     auth = SessionAuthority()
     auth.grant(Capability.FILE_WRITE_INBOUND)
     token = auth.authorize(Capability.FILE_WRITE_INBOUND)
@@ -41,37 +33,39 @@ def test_authorize_token_valid_until_capability_revoked():
     assert not token.valid
 
 
-def test_authorize_refuses_ungranted_capability():
+def test_revocation_domains_are_independent():
+    # The Phase 2.1 fix: revoking a DIFFERENT capability must NOT abort an
+    # in-flight operation bound to this one.
+    auth = SessionAuthority()
+    auth.grant(Capability.FILE_WRITE_INBOUND)
+    auth.grant(Capability.INPUT_INJECT_MOUSE)
+    file_token = auth.authorize(Capability.FILE_WRITE_INBOUND)
+    auth.revoke(Capability.INPUT_INJECT_MOUSE)
+    assert file_token.valid  # file transfer survives a mouse revoke
+
+
+def test_revoke_all_invalidates_every_token():
+    auth = SessionAuthority()
+    auth.grant(Capability.FILE_WRITE_INBOUND)
+    auth.grant(Capability.SCREEN_PUBLISH)
+    t1 = auth.authorize(Capability.FILE_WRITE_INBOUND)
+    t2 = auth.authorize(Capability.SCREEN_PUBLISH)
+    auth.revoke_all()
+    assert not t1.valid and not t2.valid
+
+
+def test_authorize_refuses_ungranted():
     auth = SessionAuthority()
     with pytest.raises(PermissionDeniedError):
         auth.authorize(Capability.FILE_WRITE_INBOUND)
-
-
-def test_revoke_all_invalidates_tokens():
-    auth = SessionAuthority()
-    auth.grant(Capability.SCREEN_PUBLISH)
-    token = auth.authorize(Capability.SCREEN_PUBLISH)
-    auth.revoke_all()
-    assert not token.valid
 
 
 def test_grant_does_not_invalidate_tokens():
     auth = SessionAuthority()
     auth.grant(Capability.SCREEN_PUBLISH)
     token = auth.authorize(Capability.SCREEN_PUBLISH)
-    auth.grant(Capability.INPUT_INJECT_MOUSE)  # widening is safe
-    assert token.valid
-
-
-def test_revoking_other_capability_still_invalidates_via_generation():
-    # Any revoke bumps the generation, so an in-flight token is conservatively
-    # invalidated even if a *different* capability was the one revoked.
-    auth = SessionAuthority()
-    auth.grant(Capability.SCREEN_PUBLISH)
     auth.grant(Capability.INPUT_INJECT_MOUSE)
-    token = auth.authorize(Capability.SCREEN_PUBLISH)
-    auth.revoke(Capability.INPUT_INJECT_MOUSE)
-    assert not token.valid
+    assert token.valid
 
 
 def test_explicit_cancel():
@@ -82,7 +76,7 @@ def test_explicit_cancel():
     assert not token.valid
 
 
-def test_gate_over_authority_sees_live_revocation():
+def test_gate_over_authority_and_bare_set():
     auth = SessionAuthority()
     auth.grant(Capability.INPUT_INJECT_MOUSE)
     gate = PermissionGate(auth)
@@ -91,9 +85,6 @@ def test_gate_over_authority_sees_live_revocation():
     with pytest.raises(PermissionDeniedError):
         gate.require(Capability.INPUT_INJECT_MOUSE)
 
-
-def test_gate_also_works_over_bare_capability_set():
     caps = CapabilitySet()
     caps.grant(Capability.CLIPBOARD_READ_LOCAL)
-    gate = PermissionGate(caps)
-    gate.require(Capability.CLIPBOARD_READ_LOCAL)
+    PermissionGate(caps).require(Capability.CLIPBOARD_READ_LOCAL)

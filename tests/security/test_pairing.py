@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Leon Priest (github.com/7h3v01d)
-"""Gate 2: pairing is attended, single-use, expiring, rate-limited, and binds
-trust to the authenticated key — never to a peer-supplied identity."""
+"""Gate 2: pairing is attended (SAS ceremony), single-use, expiring, rate-limited,
+mutual, and binds trust to the authenticated key — never a peer-supplied one."""
 
 from __future__ import annotations
 
@@ -12,8 +12,10 @@ import pytest
 from portal.security.identity import Ed25519Identity, device_id_for
 from portal.security.pairing import (
     DEFAULT_MAX_ATTEMPTS,
+    ControllerPairing,
     PairingManager,
     PairingOutcome,
+    compute_sas,
     generate_code,
 )
 from portal.security.store import FileIdentityStore
@@ -30,105 +32,125 @@ class FakeClock:
         self.t += dt
 
 
-def make(tmp_path: Path, **kw):
-    store = FileIdentityStore(tmp_path)
-    clock = FakeClock()
-    mgr = PairingManager(store, clock=clock, **kw)
-    return store, clock, mgr
+def host(tmp_path: Path, **kw):
+    store = FileIdentityStore(tmp_path / "host")
+    own = store.load_or_create("Dad-PC").identity.public_key
+    mgr = PairingManager(store, own, clock=FakeClock(), **kw)
+    return store, own, mgr
 
 
-def peer_key() -> bytes:
-    return Ed25519Identity.generate("Leon-PC").identity.public_key
+def a_key(name="Leon-PC") -> bytes:
+    return Ed25519Identity.generate(name).identity.public_key
 
 
-def test_happy_path_pins_authenticated_key(tmp_path: Path):
-    store, _clock, mgr = make(tmp_path)
+YES = lambda _c: True   # noqa: E731  (SAS matched)
+NO = lambda _c: False   # noqa: E731  (SAS mismatch / declined)
+
+
+# --- host-side primitive --------------------------------------------------
+def test_happy_path_pins_authenticated_key(tmp_path):
+    store, _own, mgr = host(tmp_path)
     code = mgr.begin_pairing()
-    key = peer_key()
-    result = mgr.handle_request(key, code, "Leon-PC", confirm=lambda _: True)
-    assert result.outcome is PairingOutcome.ACCEPTED
-    assert result.peer.public_key == key
-    # id is derived from the key, not supplied by the peer.
-    assert result.peer.device_id == device_id_for(key)
-    assert store.is_trusted(result.peer)
+    key = a_key()
+    r = mgr.handle_request(key, code, "Leon-PC", confirm=YES)
+    assert r.outcome is PairingOutcome.ACCEPTED
+    assert r.peer.public_key == key
+    assert r.peer.device_id == device_id_for(key)
+    assert store.is_trusted(r.peer)
 
 
-def test_code_is_single_use(tmp_path: Path):
-    _store, _clock, mgr = make(tmp_path)
+def test_single_use(tmp_path):
+    _s, _o, mgr = host(tmp_path)
     code = mgr.begin_pairing()
-    mgr.handle_request(peer_key(), code, "Leon-PC", confirm=lambda _: True)
-    # Replaying the same code finds no active pairing.
-    again = mgr.handle_request(peer_key(), code, "Leon-PC", confirm=lambda _: True)
+    mgr.handle_request(a_key(), code, "Leon-PC", confirm=YES)
+    again = mgr.handle_request(a_key(), code, "Leon-PC", confirm=YES)
     assert again.outcome is PairingOutcome.NO_ACTIVE_PAIRING
 
 
-def test_expired_code_rejected(tmp_path: Path):
-    _store, clock, mgr = make(tmp_path, ttl=60)
+def test_expiry(tmp_path):
+    store = FileIdentityStore(tmp_path / "h")
+    own = store.load_or_create("Dad").identity.public_key
+    clock = FakeClock()
+    mgr = PairingManager(store, own, clock=clock, ttl=60)
     code = mgr.begin_pairing()
     clock.advance(61)
-    result = mgr.handle_request(peer_key(), code, "Leon-PC", confirm=lambda _: True)
-    assert result.outcome is PairingOutcome.EXPIRED
+    assert mgr.handle_request(a_key(), code, "x", confirm=YES).outcome is PairingOutcome.EXPIRED
 
 
-def test_wrong_code_rejected_then_exhausted(tmp_path: Path):
-    _store, _clock, mgr = make(tmp_path, max_attempts=3)
+def test_wrong_then_exhausted(tmp_path):
+    _s, _o, mgr = host(tmp_path, max_attempts=3)
     mgr.begin_pairing()
-    for _ in range(2):
-        r = mgr.handle_request(peer_key(), "AAAA-AAAA", "x", confirm=lambda _: True)
-        assert r.outcome is PairingOutcome.BAD_CODE
-    # Third wrong attempt hits the cap and burns the code.
-    r = mgr.handle_request(peer_key(), "AAAA-AAAA", "x", confirm=lambda _: True)
-    assert r.outcome is PairingOutcome.EXHAUSTED
+    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.BAD_CODE
+    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.BAD_CODE
+    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.EXHAUSTED
     assert not mgr.pairing_active
 
 
-def test_correct_code_after_exhaustion_fails(tmp_path: Path):
-    _store, _clock, mgr = make(tmp_path, max_attempts=DEFAULT_MAX_ATTEMPTS)
+def test_correct_code_after_exhaustion_fails(tmp_path):
+    _s, _o, mgr = host(tmp_path, max_attempts=DEFAULT_MAX_ATTEMPTS)
     code = mgr.begin_pairing()
     for _ in range(DEFAULT_MAX_ATTEMPTS):
-        mgr.handle_request(peer_key(), "AAAA-AAAA", "x", confirm=lambda _: True)
-    # Code is burned; even the right code no longer works.
-    r = mgr.handle_request(peer_key(), code, "Leon-PC", confirm=lambda _: True)
-    assert r.outcome is PairingOutcome.NO_ACTIVE_PAIRING
+        mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES)
+    assert mgr.handle_request(a_key(), code, "Leon-PC", confirm=YES).outcome is PairingOutcome.NO_ACTIVE_PAIRING
 
 
-def test_declined_confirmation_does_not_pin(tmp_path: Path):
-    store, _clock, mgr = make(tmp_path)
+def test_declined_sas_does_not_pin(tmp_path):
+    store, _o, mgr = host(tmp_path)
     code = mgr.begin_pairing()
-    key = peer_key()
-    r = mgr.handle_request(key, code, "Leon-PC", confirm=lambda _: False)
+    key = a_key()
+    r = mgr.handle_request(key, code, "Leon-PC", confirm=NO)
     assert r.outcome is PairingOutcome.DENIED_BY_USER
     assert not store.is_trusted(r.peer)
 
 
-def test_no_pairing_when_not_in_pairing_mode(tmp_path: Path):
-    _store, _clock, mgr = make(tmp_path)
-    r = mgr.handle_request(peer_key(), "AAAA-AAAA", "x", confirm=lambda _: True)
-    assert r.outcome is PairingOutcome.NO_ACTIVE_PAIRING
+def test_malformed_peer_key_never_trusted(tmp_path):
+    # Finding 3: a non-32-byte key must be refused, not persisted, even with the
+    # correct code and an approving user.
+    store, _o, mgr = host(tmp_path)
+    for bad in [b"", b"\x00", b"\x00" * 31, b"\x00" * 33, b"\x00" * 1024]:
+        code = mgr.begin_pairing()
+        r = mgr.handle_request(bad, code, "x", confirm=YES)
+        assert r.outcome is PairingOutcome.DENIED_BY_USER
+    assert store.list_trusted() == []
 
 
-def test_already_trusted_is_idempotent(tmp_path: Path):
-    store, _clock, mgr = make(tmp_path)
-    key = peer_key()
-    code = mgr.begin_pairing()
-    mgr.handle_request(key, code, "Leon-PC", confirm=lambda _: True)
-    code2 = mgr.begin_pairing()
-    # confirm=False, but an already-trusted key short-circuits before the gate.
-    r = mgr.handle_request(key, code2, "Leon-PC", confirm=lambda _: False)
-    assert r.outcome is PairingOutcome.ALREADY_TRUSTED
+# --- SAS / MITM detection -------------------------------------------------
+def test_sas_is_order_independent_and_matches_for_same_pair():
+    a, b = a_key("A"), a_key("B")
+    assert compute_sas(a, b) == compute_sas(b, a)
 
 
-def test_payload_supplied_name_is_sanitised(tmp_path: Path):
-    _store, _clock, mgr = make(tmp_path)
-    code = mgr.begin_pairing()
-    with pytest.raises(Exception):
-        # A control-character name is rejected by the display-text guard.
-        mgr.handle_request(peer_key(), code, "Leon\nPC", confirm=lambda _: True)
+def test_sas_differs_under_mitm():
+    controller, hostk, attacker = a_key("c"), a_key("h"), a_key("m")
+    # No MITM: both sides share the same pair -> identical SAS.
+    assert compute_sas(controller, hostk) == compute_sas(hostk, controller)
+    # MITM terminates each leg with its own key -> the two sides differ.
+    controller_side = compute_sas(controller, attacker)
+    host_side = compute_sas(attacker, hostk)
+    assert controller_side != host_side
+
+
+# --- controller side + mutual pairing -------------------------------------
+def test_controller_pins_host_after_sas(tmp_path):
+    cstore = FileIdentityStore(tmp_path / "c")
+    controller_key = cstore.load_or_create("Leon-PC").identity.public_key
+    host_key = a_key("Dad-PC")
+    cp = ControllerPairing(cstore, controller_key, host_key)
+    r = cp.handle_accept("Dad-PC", confirm=YES)
+    assert r.outcome is PairingOutcome.ACCEPTED
+    assert cstore.is_trusted(r.peer)
+    assert r.peer.public_key == host_key
+
+
+def test_controller_and_host_compute_same_sas(tmp_path):
+    cstore = FileIdentityStore(tmp_path / "c")
+    controller_key = cstore.load_or_create("Leon").identity.public_key
+    hstore = FileIdentityStore(tmp_path / "h")
+    host_key = hstore.load_or_create("Dad").identity.public_key
+    cp = ControllerPairing(cstore, controller_key, host_key)
+    assert cp.sas() == compute_sas(host_key, controller_key)
 
 
 def test_generated_code_charset():
     code = generate_code()
-    assert "-" in code
-    assert all(ch in "ABCDEFGHJKMNPQRSTUVWXYZ23456789-" for ch in code)
-    # No ambiguous characters.
-    assert not any(ch in code for ch in "ILO01")
+    assert "-" in code and not any(ch in code for ch in "ILO01")

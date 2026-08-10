@@ -35,7 +35,7 @@ from ..common.constants import (
 from .capabilities import Capability
 
 # Shared strict config for every wire model.
-_WIRE = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False, frozen=True)
+_WIRE = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False, frozen=True, validate_default=True)
 
 # Enum-by-value is legitimate wire deserialization, not the dangerous scalar
 # coercion strict mode exists to block. These annotated aliases accept the value
@@ -179,7 +179,7 @@ class PairAcceptPayload(BaseModel):
 
 class PairDenyPayload(BaseModel):
     model_config = _WIRE
-    reason: str = Field(default="denied", max_length=MAX_ERROR_CODE_LEN, pattern=r"^[A-Z0-9_.-]+$")
+    reason: str = Field(default="DENIED", max_length=MAX_ERROR_CODE_LEN, pattern=r"^[A-Z0-9_.-]+$")
 
 
 class CapabilityChangePayload(BaseModel):

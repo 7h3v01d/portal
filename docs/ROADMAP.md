@@ -91,16 +91,26 @@ non-string-type, deeply-nested, unknown, unimplemented, unsupported/newer,
 oversized, extra-key, coercion, non-finite, and duplicate-key messages all
 rejected with a specific ProtocolError before anything acts on them.
 
-### Phase 2 — Identity & pairing *(0.0.2 — this build)*
-On-disk `FileIdentityStore` (atomic writes; private key passphrase-encryptable,
-owner-only otherwise; trust keyed on the full public key). `PairingManager` with
-one-time codes that are **single-use, expiring, and rate-limited**, binding trust
-to the transport-**authenticated** key rather than any peer-asserted identity,
-and pinning (TOFU) only after **explicit local fingerprint confirmation**. The
-`PAIR_REQUEST/ACCEPT/DENY` message types are now registered and active. **Gate 2:**
-attended-only, explicit local approval, no silent connection — a burned/expired/
-exhausted code cannot pair, and an imposter forging a trusted device's display id
-with a different key is not trusted.
+### Phase 2 — Identity & pairing *(0.0.2 — this build, hardened in 2.1)*
+On-disk `FileIdentityStore` (atomic writes, in-process lock so a concurrent
+revoke can't be lost, private key passphrase-encryptable; public key is
+authoritative and the id is re-derived on load; malformed keys refused).
+`PairingManager` (host) + `ControllerPairing` (controller) implement **mutual**
+pairing: one-time codes that are **single-use, expiring (monotonic clock), and
+rate-limited**, binding trust to the transport-**authenticated** key, pinned only
+after a **Short Authentication String** ceremony.
+
+**Gate 2A — host trust establishment: CLOSED.** **Gate 2B — mutual end-to-end
+pairing: CLOSED** (PAIR_REQUEST → PAIR_ACCEPT/DENY exercised through the codec,
+both installations pin each other).
+
+**SAS invariant (non-negotiable, esp. for the internet phases):** pairing
+approval means the SAS shown on this machine was compared *out of band* against
+the SAS on the other physical machine and matched. Both machines derive the same
+SAS from both public keys, so an active MITM (its own key on each leg) produces
+different strings on each side and the comparison fails. The `confirm` callback
+is that ceremony; the UI that implements it is bound by this invariant and must
+be tested at the UI boundary.
 
 ### Phase 3 — LAN file transfer *(0.1.0 — first shippable)*
 The first genuinely useful build. TLS-over-TCP transport + chunked transfer:

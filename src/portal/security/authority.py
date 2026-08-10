@@ -6,27 +6,28 @@ Point-in-time capability checks are enough for a single input event; the next
 event sees the revocation. They are NOT enough for a long-running operation — a
 5 GB transfer authorised under `file.write.inbound` keeps running if that
 capability is revoked mid-flight, because nothing re-checks. So "revocation is
-instant" is made an enforceable property:
+instant" is made an enforceable property with **independent** cancellation
+domains:
 
-  - the authority holds a monotonically increasing *generation*;
-  - any revoke bumps the generation, invalidating every token issued before it;
+  - each capability has its own generation counter;
+  - `revoke(C)` bumps only C's generation — a running mouse session is not
+    aborted because a file capability was revoked, and vice versa;
+  - `revoke_all()` bumps every capability's generation (the emergency kill);
   - a long-running op takes a **capability-bound** token when it starts and
-    checks `token.valid` at each step, aborting the moment it goes stale.
+    checks `token.valid` at each step, aborting the moment its own capability's
+    generation moves or the capability is dropped.
 
-A capability-bound token is valid iff BOTH the generation is unchanged AND the
-specific capability it was issued for is still granted — stronger than a generic
-cancellation token.
+This matches the constitutional claim that capabilities are *independently*
+revocable — their cancellation domains are now independent, not just their
+membership.
 
 **No mutable capability set is exposed.** The only way to change authority is
-through `grant`/`revoke`/`revoke_all` on the authority itself, so a revoke can
-never happen without bumping the generation. Reading is via `has`/`granted`
-(a frozenset copy), never the live set.
+through `grant`/`revoke`/`revoke_all` here, so a revoke can never happen without
+bumping the relevant generation. Reading is via `has`/`granted` (a frozenset
+copy), never the live set.
 
-**Concurrency contract.** A SessionAuthority is owned by a single event loop /
-thread and is NOT internally synchronised: `revoke` then `generation += 1` is
-two operations, and a reader on another thread could observe the gap. Mutate and
-read it from the one owning context; cross-thread hand-offs must marshal onto it.
-"""
+**Concurrency contract.** Owned by a single event loop / thread; not internally
+synchronised."""
 
 from __future__ import annotations
 
@@ -35,8 +36,9 @@ from ..protocol.capabilities import Capability, CapabilitySet
 
 
 class CancellationToken:
-    """A capability-bound snapshot. Invalid the instant a revoke bumps the
-    generation past it, the bound capability is dropped, or it is cancelled."""
+    """A capability-bound snapshot. Invalid the instant its own capability's
+    generation moves (a revoke of that capability or revoke_all), the capability
+    is dropped, or it is cancelled."""
 
     __slots__ = ("_authority", "_capability", "_generation", "_cancelled")
 
@@ -54,7 +56,7 @@ class CancellationToken:
     def valid(self) -> bool:
         return (
             not self._cancelled
-            and self._authority.generation == self._generation
+            and self._authority.generation_of(self._capability) == self._generation
             and self._authority.has(self._capability)
         )
 
@@ -63,18 +65,17 @@ class CancellationToken:
 
 
 class SessionAuthority:
-    """Owns the live capabilities plus the generation counter. The mutable set is
-    private; callers mutate only through this object's methods."""
+    """Owns the live capabilities plus a per-capability generation counter. The
+    mutable set is private; callers mutate only through this object's methods."""
 
-    __slots__ = ("_caps", "_generation")
+    __slots__ = ("_caps", "_generations")
 
     def __init__(self) -> None:
         self._caps = CapabilitySet()
-        self._generation = 0
+        self._generations: dict[Capability, int] = {}
 
-    @property
-    def generation(self) -> int:
-        return self._generation
+    def generation_of(self, capability: Capability) -> int:
+        return self._generations.get(capability, 0)
 
     # --- reads (never the mutable set) ---
     def has(self, capability: Capability) -> bool:
@@ -83,22 +84,25 @@ class SessionAuthority:
     def granted(self) -> frozenset[Capability]:
         return self._caps.granted()
 
-    # --- mutations (revocation always bumps the generation) ---
+    # --- mutations (revocation bumps the relevant generation) ---
     def grant(self, capability: Capability) -> None:
         self._caps.grant(capability)  # widening authority does not invalidate tokens
 
     def revoke(self, capability: Capability) -> None:
         self._caps.revoke(capability)
-        self._generation += 1
+        self._generations[capability] = self.generation_of(capability) + 1
 
     def revoke_all(self) -> None:
+        # Emergency kill: bump every capability's generation so no outstanding
+        # token of any kind survives, then drop all grants.
+        for capability in Capability:
+            self._generations[capability] = self.generation_of(capability) + 1
         self._caps.revoke_all()
-        self._generation += 1
 
     # --- capability-bound authorization for long-running work ---
     def authorize(self, capability: Capability) -> CancellationToken:
         """Verify the capability is granted right now and return a token bound to
-        it. Raises if not granted, so an unauthorised long op never starts."""
+        it and to its current generation. Raises if not granted."""
         if not self._caps.has(capability):
             raise PermissionDeniedError(f"missing capability: {capability}")
-        return CancellationToken(self, capability, self._generation)
+        return CancellationToken(self, capability, self.generation_of(capability))

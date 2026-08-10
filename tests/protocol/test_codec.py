@@ -209,3 +209,23 @@ def test_encode_rejects_raw_envelope_with_junk_payload():
                    timestamp=1, payload={"junk": 1})
     with pytest.raises(ProtocolError):
         encode(env)
+
+
+@pytest.mark.parametrize("bad", [None, "a string", 123, object(), 1.0])
+def test_decode_non_bytes_is_protocol_error(bad):
+    with pytest.raises(ProtocolError):  # DecodeError, not a bare TypeError
+        decode(bad)
+
+
+def test_decode_accepts_bytearray():
+    good = bytearray(encode(build(MessageType.PING, EmptyPayload(), sequence=1)))
+    assert decode(good).type is MessageType.PING
+
+
+def test_pair_deny_default_satisfies_its_own_pattern():
+    # Finding 4: the default must not violate the field's declared pattern, and
+    # validate_default now enforces this at construction.
+    from portal.protocol.messages import PairDenyPayload
+
+    msg = decode(encode(build(MessageType.PAIR_DENY, PairDenyPayload(), sequence=1)))
+    assert msg.payload.reason == "DENIED"
