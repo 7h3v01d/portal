@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portal"
+version = "0.0.1"
+description = "Secure, self-hosted Windows remote-assistance and file-transfer tool."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Leon Priest" }]
+keywords = ["remote-desktop", "remote-support", "file-transfer", "webrtc", "pyqt6"]
+
+# Core only. The foundation and its tests need nothing more than these. Every
+# heavier dependency is opt-in via an extra, so `pip install portal` does not
+# drag in the entire eventual stack — and a dependency failure is isolated to
+# the phase that needs it. This also matches the roadmap claim that LAN file
+# transfer and screen view ship without aiortc installed.
+dependencies = [
+    "cryptography",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+# UI toolkit. NOTE: PyQt6's free build is GPLv3, which is in tension with the
+# project's Apache-2.0 licence when binaries are distributed. Kept as PyQt6 for
+# estate consistency; see docs/LICENSING.md for the resolution and the PySide6
+# alternative. Installing this extra is a deliberate act.
+ui = ["PyQt6"]
+capture = ["dxcam; sys_platform == 'win32'", "av"]
+webrtc = ["aiortc"]
+server = ["fastapi", "uvicorn"]
+dev = ["pytest", "pytest-asyncio"]
+full = [
+    "PyQt6",
+    "dxcam; sys_platform == 'win32'",
+    "av",
+    "aiortc",
+    "fastapi",
+    "uvicorn",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
