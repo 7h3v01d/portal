@@ -10,7 +10,7 @@ yourself.
 
 **Phase 4 — Screen capture (0.2.0).** Backend-agnostic capture runtime (pacing,
 pause, resolution-change detection, device-loss recovery, bounded queue) on top of
-the authenticated transport and verified transfer. 200 test cases green (151 test functions). Gates 1-4 + Gate 3.1 (listener/pairing DoS throttling) closed. Real DXcam grab is validated on the Windows rig; no input injection yet —
+the authenticated transport and verified transfer. 202 test cases green (153 test functions). Gates 1-4 + Gate 3.1 (listener/pairing DoS throttling) closed. Real DXcam grab is validated on the Windows rig; no input injection yet —
 see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Design principle

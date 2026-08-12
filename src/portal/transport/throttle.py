@@ -24,26 +24,57 @@ from typing import Callable
 class SlidingWindowRateLimiter:
     """Allow at most `max_events` per `window_seconds` per key."""
 
-    def __init__(self, max_events: int, window_seconds: float, clock: Callable[[], float] | None = None) -> None:
+    def __init__(
+        self,
+        max_events: int,
+        window_seconds: float,
+        clock: Callable[[], float] | None = None,
+        max_tracked_keys: int = 8192,
+    ) -> None:
         self._max = max_events
         self._window = window_seconds
         self._clock = clock or time.monotonic
         self._events: dict[str, deque[float]] = defaultdict(deque)
+        self._max_tracked_keys = max_tracked_keys
+        self._last_sweep = self._clock()
+
+    def _sweep(self, now: float) -> None:
+        """Drop keys whose window has fully emptied. Bounds memory to sources
+        seen within the last window — without this, a stream of distinct source
+        keys (a botnet / spoofed IPs) grows the map forever, which would make the
+        rate limiter itself a memory-exhaustion vector."""
+        cutoff = now - self._window
+        dead = []
+        for key, q in self._events.items():
+            while q and q[0] <= cutoff:
+                q.popleft()
+            if not q:
+                dead.append(key)
+        for key in dead:
+            del self._events[key]
+        self._last_sweep = now
 
     def allow(self, key: str) -> bool:
         now = self._clock()
+        # Sweep on a cadence (at most once per window) and immediately if the map
+        # has grown past its bound, so peak and steady-state memory are capped.
+        if now - self._last_sweep >= self._window or len(self._events) > self._max_tracked_keys:
+            self._sweep(now)
+
         q = self._events[key]
         cutoff = now - self._window
         while q and q[0] <= cutoff:
             q.popleft()
-        if not q:
-            # prune empty keys so a stream of distinct sources can't grow memory
-            del self._events[key]
-            q = self._events[key]
         if len(q) >= self._max:
+            if not q:  # shouldn't happen given the check, but keep the map clean
+                del self._events[key]
             return False
         q.append(now)
         return True
+
+    @property
+    def tracked_keys(self) -> int:
+        return len(self._events)
 
 
 class ConcurrencyLimiter:
@@ -58,7 +89,7 @@ class ConcurrencyLimiter:
     def acquire(self, key: str) -> bool:
         if self._global >= self._global_max:
             return False
-        if self._per_key[key] >= self._per_key_max:
+        if self._per_key.get(key, 0) >= self._per_key_max:  # .get avoids spurious entries
             return False
         self._per_key[key] += 1
         self._global += 1

@@ -45,6 +45,35 @@ def test_rate_limiter_is_per_key():
     assert not rl.allow("a")
 
 
+def test_rate_limiter_does_not_leak_keys_under_distinct_flood():
+    # The self-review finding: a stream of distinct source keys must NOT grow the
+    # tracking map without bound. After windows pass, abandoned keys are swept.
+    clk = FakeClock()
+    rl = SlidingWindowRateLimiter(5, 10.0, clock=clk)
+    # 10 waves of 500 distinct one-shot sources, each wave a full window apart.
+    for wave in range(10):
+        for i in range(500):
+            rl.allow(f"wave{wave}-src{i}")
+        clk.advance(11)  # let the previous wave's window fully expire
+    # A quiet call triggers the cadence sweep; the map should hold ~one wave, not
+    # all 5000 keys ever seen.
+    rl.allow("trigger-sweep")
+    assert rl.tracked_keys < 600, f"key map grew to {rl.tracked_keys} — leak"
+
+
+def test_rate_limiter_immediate_sweep_on_peak():
+    clk = FakeClock()
+    rl = SlidingWindowRateLimiter(5, 10.0, clock=clk, max_tracked_keys=100)
+    # Fill past the peak bound within one window; expired keys are swept eagerly.
+    for i in range(50):
+        rl.allow(f"old-{i}")
+    clk.advance(11)  # these expire
+    for i in range(200):
+        rl.allow(f"new-{i}")  # crossing max_tracked_keys forces a sweep
+    # The 50 expired 'old' keys were swept; only active 'new' keys remain.
+    assert rl.tracked_keys <= 205
+
+
 def test_concurrency_per_key_and_global():
     cl = ConcurrencyLimiter(per_key_max=2, global_max=3)
     assert cl.acquire("a") and cl.acquire("a")
