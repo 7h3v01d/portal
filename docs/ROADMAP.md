@@ -229,15 +229,44 @@ The live-since-Phase-3 exposure, now closed:
 The socket wiring passes the remote IP through as the throttle/attempt key; the
 rate-limiter and attempt logic are unit-tested independently.
 
-### Phase 5 — Video pipeline *(0.2.0)*
-PyAV encode. First target 1280×720@15, then 1080p@30. Measure capture/encode/
-network/decode/render latency. **Gate 5:** 30-min session, bounded RAM, no
-growing frame queue, graceful drop, encoder-failure handling.
+### Phase 5 — Video pipeline *(0.2.0 — this build)*
+H.264 encode pipeline turning captured BGRA frames into a network-ready packet
+stream. `encode/pyav_backend.py` is a real libx264 encoder tuned zero-latency
+(no B-frames/lookahead → one frame in, one packet out) — and because PyAV bundles
+FFmpeg, it is genuinely tested here (encode + FFmpeg decode round-trip), not just
+on the rig. `encode/pipeline.py` owns the long-session concerns: a bounded
+drop-oldest output queue that never drops a keyframe (RAM can't grow with session
+length), encoder reopen + forced keyframe on resolution change, bounded
+encoder-failure recovery (consecutive failures reset by a good packet), and a
+terminal signal so `get()` can't hang. `encode/synthetic.py` fakes the encoder so
+the pipeline logic is testable without FFmpeg.
 
-### Phase 6 — LAN screen viewer *(0.3.0)*
-Wire the video track through the transport to a PyQt6 viewer (dark-industrial).
-**Gate 6:** viewing *only* — no input path exists yet. The separation is
-intentional.
+**Gate 5 — covered by tests:** real encode→decode round-trip, keyframe forcing,
+resolution-change reopen, transient-failure recovery, permanent-failure bounded
+termination, source-termination propagation, keyframe-preserving bounded queue,
+and capture→encode composed end-to-end. Sustained-run RAM shown bounded (both
+queues stay at their caps under a slow consumer).
+**Deferred to hardware validation:** encode latency/throughput on the rig with
+real DXcam frames; hardware encoders (NVENC/QSV) as future backends.
+
+### Phase 6 — LAN screen viewer *(0.3.0 — this build)*
+Closes the loop: capture → encode → **transport → decode → display**. The host's
+`stream/publish.py` ties CaptureSession → EncodePipeline → the bulk channel, gated
+by the `screen.publish` capability (checked before start AND per packet, so a
+revoke stops the stream on the next frame). The controller's `stream/viewer.py`
+requests the stream (STREAM_START), reads geometry (STREAM_PARAMS), and pulls
+packets off bulk → `decode/pyav_decoder.py` (real FFmpeg H.264) → displayable
+RGB24 frames, requesting a keyframe to (re)sync. Video rides a compact binary
+header on the bulk channel (`encode/wire.py`); control (start/stop/keyframe/params)
+rides the strict codec. `ui/viewer_widget.py` is a thin PyQt6 blit surface,
+validated on the rig; all the real logic is in ScreenViewer and tested here.
+
+**Gate 6 — covered by tests:** full loop over REAL TLS (synthetic capture → real
+libx264 → TLS → real decode → RGB frames), wire-codec round-trip + bad-magic/short
+rejection, decoder waits-for-keyframe resync, publish requires `screen.publish`
+(wrong capability denied), and **instant revocation stops the stream**.
+**Deferred to hardware validation:** the Qt render surface and end-to-end
+glass-to-glass latency on the rig with real DXcam frames.
 
 ### Phase 7 — Remote mouse *(0.4.0 — MVP complete)*
 Control events over the data channel using normalised 0.0–1.0 coordinates.

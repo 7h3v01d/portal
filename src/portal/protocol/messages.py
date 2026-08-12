@@ -81,6 +81,12 @@ class MessageType(str, Enum):
     FILE_COMPLETE = "file_complete"
     FILE_CANCEL = "file_cancel"
 
+    # Screen streaming (Phase 6)
+    STREAM_START = "stream_start"    # controller -> host: begin publishing screen
+    STREAM_STOP = "stream_stop"      # controller -> host: stop
+    STREAM_PARAMS = "stream_params"  # host -> controller: stream geometry
+    STREAM_KEYFRAME = "stream_keyframe"  # controller -> host: force an IDR
+
     # Clipboard (Phase 13)
     CLIPBOARD_UPDATE = "clipboard_update"
 
@@ -200,6 +206,19 @@ class ErrorPayload(BaseModel):
     detail: str = Field(default="", max_length=MAX_ERROR_DETAIL_LEN)
 
 
+class StreamStartPayload(BaseModel):
+    model_config = _WIRE
+    fps: int = Field(default=30, ge=1, le=120)
+    bitrate: int = Field(default=6_000_000, ge=100_000, le=100_000_000)
+
+
+class StreamParamsPayload(BaseModel):
+    model_config = _WIRE
+    width: int = Field(ge=1, le=16384)
+    height: int = Field(ge=1, le=16384)
+    fps: int = Field(ge=1, le=120)
+
+
 class FileOfferPayload(BaseModel):
     """Strict wire schema for a file offer — no ad-hoc JSON, same discipline as
     every other control message. Path-safety of the filename is enforced
@@ -230,6 +249,10 @@ PAYLOAD_SCHEMAS: dict[MessageType, type[BaseModel]] = {
     MessageType.FILE_OFFER: FileOfferPayload,
     MessageType.FILE_ACCEPT: EmptyPayload,
     MessageType.FILE_REJECT: EmptyPayload,
+    MessageType.STREAM_START: StreamStartPayload,
+    MessageType.STREAM_STOP: EmptyPayload,
+    MessageType.STREAM_PARAMS: StreamParamsPayload,
+    MessageType.STREAM_KEYFRAME: EmptyPayload,
 }
 
 

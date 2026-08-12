@@ -8,6 +8,6 @@ grants zero authority by itself.** Every capability is explicitly granted and
 independently revocable.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "Leon Priest"
 __license__ = "Apache-2.0"

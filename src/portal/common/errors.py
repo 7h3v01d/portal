@@ -75,5 +75,9 @@ class CaptureError(PortalError):
     """Screen-capture backend failure."""
 
 
+class EncodeError(PortalError):
+    """Video encoding failure (encoder open/encode/reconfigure error)."""
+
+
 class InputError(PortalError):
     """Input-injection backend failure."""

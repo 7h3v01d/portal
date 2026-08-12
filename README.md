@@ -8,9 +8,13 @@ yourself.
 
 ## Status
 
-**Phase 4 — Screen capture (0.2.0).** Backend-agnostic capture runtime (pacing,
-pause, resolution-change detection, device-loss recovery, bounded queue) on top of
-the authenticated transport and verified transfer. 202 test cases green (153 test functions). Gates 1-4 + Gate 3.1 (listener/pairing DoS throttling) closed. Real DXcam grab is validated on the Windows rig; no input injection yet —
+**Phase 6 — LAN screen viewer (0.3.0).** The full screen-share loop —
+capture → H.264 encode → authenticated TLS → decode → display — works end to end,
+capability-gated with instant revocation, on top of the hardened identity,
+pairing, transport, and transfer foundation. 221 test cases green (172 test
+functions). Gates 1-6 + Gate 3.1 closed; the whole media loop is tested in-tree
+(real libx264 encode/decode over real TLS). Real DXcam grab and the Qt render
+surface are validated on the Windows rig; no input injection yet —
 see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Design principle
@@ -32,6 +36,9 @@ src/portal/
   security/    identity, store, pairing, handshake, session, authority, validation
   transport/   Transport interface + TLS transport (channel-bound auth)
   capture/     CaptureBackend + session, pacing, synthetic + DXcam backends
+  encode/      VideoEncoder + pipeline + wire, synthetic + PyAV/libx264 backends
+  decode/      PyAV/FFmpeg H.264 decoder
+  stream/      screen publisher (host) + viewer (controller)
   input/       InputBackend interface      (Windows SendInput later)
   transfer/    TransferBackend interface + LAN engine (verify + atomic rename)
   host/        host agent + session        (later phases)
