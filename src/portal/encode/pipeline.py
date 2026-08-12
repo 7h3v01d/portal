@@ -61,6 +61,11 @@ class EncodePipeline:
         self._queue: deque[EncodedPacket] = deque(maxlen=max_queue)
         self._available = asyncio.Event()
         self._terminal: Exception | None = None
+        # Visibility into the keyframe-protection drop path: under sustained
+        # backpressure the queue can degrade to "keyframe + few deltas", and a
+        # 30-minute session needs that to be observable, not silent.
+        self._protected_drops = 0
+        self._protected_drops_since_log = 0
 
     async def start(self) -> None:
         self._encoder.open(self._w, self._h, self._fps, self._bitrate)
@@ -103,9 +108,25 @@ class EncodePipeline:
         # Never drop a keyframe: if the queue is full and the oldest is a keyframe,
         # drop the newest non-keyframe instead so decoders can still resync.
         if len(self._queue) == self._queue.maxlen and self._queue[0].is_keyframe and not packet.is_keyframe:
+            self._protected_drops += 1
+            self._protected_drops_since_log += 1
+            # Log on a rising cadence rather than per-drop so a sustained stall is
+            # visible without flooding the log.
+            if self._protected_drops_since_log >= 64:
+                _log.warning(
+                    "encode backpressure: %d delta packets dropped to protect a queued keyframe "
+                    "(consumer/network too slow)", self._protected_drops
+                )
+                self._protected_drops_since_log = 0
             return
         self._queue.append(packet)
         self._available.set()
+
+    @property
+    def protected_drops(self) -> int:
+        """Count of delta packets dropped to protect a queued keyframe — a health
+        signal for sustained backpressure."""
+        return self._protected_drops
 
     def _terminate(self, error: Exception | None) -> None:
         self._running = False
@@ -113,6 +134,16 @@ class EncodePipeline:
         self._available.set()
 
     async def _reconfigure(self, width: int, height: int) -> None:
+        # Drain anything libx264 still holds from the old geometry before the
+        # reopen discards it. With zerolatency this is normally empty, but doing
+        # it explicitly makes the boundary contract clear rather than tuning-
+        # dependent, and avoids a rare lost frame at the size change.
+        try:
+            for pkt in self._encoder.flush():
+                if (pkt.width, pkt.height) == (self._w, self._h):
+                    self._enqueue(pkt)
+        except Exception:  # noqa: BLE001
+            pass
         self._w, self._h = width, height
         self._encoder.open(width, height, self._fps, self._bitrate)
         self._encoder.request_keyframe()

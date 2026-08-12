@@ -127,3 +127,5 @@ async def test_bounded_queue_never_drops_keyframe():
     q = list(pipe._queue)  # noqa: SLF001
     assert len(q) == 3
     assert q[0].is_keyframe  # the keyframe was never dropped
+    # The protected-drop path is observable, not silent.
+    assert pipe.protected_drops == 8  # 10 deltas offered, 2 fit, 8 protected-dropped
