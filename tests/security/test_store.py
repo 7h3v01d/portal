@@ -158,3 +158,34 @@ def test_shared_lock_prevents_cross_instance_resurrection(tmp_path: Path):
 
     assert not a.is_trusted(dad)  # revoke not lost
     assert all(a.is_trusted(p) for p in extra)
+
+
+def test_persisted_peer_name_with_injection_is_skipped(tmp_path: Path):
+    # Finding 4: a tampered persisted name with newline/bidi must not load; the
+    # persistence boundary keeps the same invariant as the wire.
+    import json
+
+    peer = _peer("Dad-PC")
+    store = FileIdentityStore(tmp_path)
+    store.trust(peer)
+    rows = json.loads((tmp_path / "trusted.json").read_text())
+    rows[0]["device_name"] = "Dad-PC\nFAKE TRUST EVENT\u202e"
+    (tmp_path / "trusted.json").write_text(json.dumps(rows))
+    # The unsafe row is skipped, not coerced into a trusted identity.
+    assert FileIdentityStore(tmp_path).list_trusted() == []
+
+
+def test_added_at_is_preserved_across_rewrites(tmp_path: Path):
+    # Finding 5: adding a second peer must not restamp the first peer's added_at.
+    import json
+
+    store = FileIdentityStore(tmp_path)
+    dad = _peer("Dad")
+    store.trust(dad)
+    first = json.loads((tmp_path / "trusted.json").read_text())[0]["added_at"]
+
+    import time as _t
+    _t.sleep(1.1)
+    store.trust(_peer("Laptop"))
+    rows = {r["public_key"]: r["added_at"] for r in json.loads((tmp_path / "trusted.json").read_text())}
+    assert rows[dad.public_key.hex()] == first  # unchanged

@@ -11,12 +11,19 @@ The design rests on six properties, in priority order:
      only proves "the peer owns this key", not "this key is Dad's computer".
      Before pinning, BOTH machines display the same Short Authentication String,
      derived from BOTH public keys, and a human confirms they match out of band.
-     The SAS is **80 bits**: an active MITM controls the keys it presents on each
-     leg and could otherwise *grind* keys until the two legs' SAS collide (a
-     6-digit / ~20-bit SAS was ground to a collision in ~12s of ordinary Python).
-     At 80 bits that search is ~2**80 — infeasible. (For the later internet phase,
-     use an established PAKE — SPAKE2+/OPAQUE — rather than a home-grown protocol,
-     so the one-time code becomes a real secret instead of plaintext in transit.)
+
+     The threat is an active MITM that presents its OWN key on each leg and tries
+     to make both legs show the same SAS. Crucially it chooses BOTH keys, so this
+     is a two-sided claw/collision search, not a one-sided preimage: the generic
+     work factor is ~n/2 for an n-bit SAS (birthday bound), NOT n. A 6-digit
+     (~20-bit) SAS collides in ~2**10 work; even an 80-bit SAS only gives ~2**40
+     collision resistance, which is feasible offline because a bare-hash SAS
+     carries no fresh session secret. So the SAS output is **160 bits**, giving
+     ~2**80 generic collision resistance. This is a usable-but-long string; the
+     proper long-term fix (and the internet-phase plan) is an established PAKE
+     (SPAKE2+/OPAQUE) with commitment, so a short SAS becomes safe again and the
+     one-time code becomes a real secret rather than plaintext in transit. We do
+     not invent that ourselves.
 
   3. **Single-use.** A code is consumed the moment it is correctly redeemed (and
      when it is exhausted by wrong guesses), so it can't be replayed.
@@ -56,6 +63,7 @@ from enum import Enum
 from typing import Callable
 
 from ..common.constants import MAX_DEVICE_NAME_LEN
+from ..common.errors import PairingError
 from ..common.logging import get_logger, redact
 from .identity import DeviceIdentity, IdentityStore
 from .validation import ensure_display_text
@@ -67,7 +75,7 @@ _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 DEFAULT_TTL_SECONDS = 180.0
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_CODE_GROUPS = 2      # 2 groups of 4 = 8 chars ~ 40 bits
-SAS_BYTES = 10              # 80 bits — load-bearing; see module docstring
+SAS_BYTES = 20             # 160-bit output -> ~80-bit generic collision resistance (n/2)
 
 
 class PairingOutcome(Enum):
@@ -76,8 +84,9 @@ class PairingOutcome(Enum):
     NO_ACTIVE_PAIRING = "no_active_pairing"
     NO_PENDING_COMMIT = "no_pending_commit"
     BAD_CODE = "bad_code"
+    SOURCE_THROTTLED = "source_throttled"  # this source used its guess budget
     EXPIRED = "expired"
-    EXHAUSTED = "exhausted"
+    EXHAUSTED = "exhausted"             # global backstop tripped — code burned
     ALREADY_TRUSTED = "already_trusted"
     DENIED_BY_USER = "denied_by_user"
     DENIED_BY_PEER = "denied_by_peer"
@@ -110,8 +119,14 @@ class _PendingPairing:
     nonce: str
     created_at: float
     ttl: float
-    max_attempts: int
-    attempts: int = 0
+    per_source_max: int
+    global_max: int
+    global_attempts: int = 0
+    source_attempts: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.source_attempts is None:
+            self.source_attempts = {}
 
     def expired(self, now: float) -> bool:
         return now >= self.created_at + self.ttl
@@ -168,13 +183,17 @@ class PairingManager:
         *,
         clock: Callable[[], float] = time.monotonic,
         ttl: float = DEFAULT_TTL_SECONDS,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        per_source_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        global_attempts: int | None = None,
     ) -> None:
+        from ..common.constants import PAIR_ATTEMPTS_GLOBAL_MAX
+
         self._store = store
         self._own_key = bytes(own_public_key)
         self._clock = clock
         self._ttl = ttl
-        self._max_attempts = max_attempts
+        self._per_source_max = per_source_attempts
+        self._global_max = global_attempts if global_attempts is not None else PAIR_ATTEMPTS_GLOBAL_MAX
         self._pending: _PendingPairing | None = None
         self._pending_commit: _PendingCommit | None = None
 
@@ -198,14 +217,21 @@ class PairingManager:
 
     def begin_pairing(self) -> str:
         """Enter pairing mode. Returns the plaintext code to display exactly once;
-        only its hash is retained. A transaction nonce is generated internally."""
+        only its hash is retained. A transaction nonce is generated internally.
+
+        Refuses if a previous pairing is still awaiting its final commit — the
+        state machine holds at most one transaction, and transitions out of a
+        pending commit must be explicit (commit / cancel / expire)."""
+        if self.awaiting_commit:
+            raise PairingError("a pairing is awaiting commit; commit or cancel first")
         code = generate_code()
         self._pending = _PendingPairing(
             code_hash=_hash_code(code),
             nonce=secrets.token_hex(16),
             created_at=self._clock(),
             ttl=self._ttl,
-            max_attempts=self._max_attempts,
+            per_source_max=self._per_source_max,
+            global_max=self._global_max,
         )
         return code
 
@@ -219,11 +245,14 @@ class PairingManager:
         code: str,
         device_name_hint: str,
         confirm: Callable[[PairingConfirmation], bool],
+        source: str = "local",
     ) -> PairingResult:
         """Process an incoming pairing request. `peer_public_key` MUST be the key
-        the transport authenticated. On a confirmed SAS this does NOT trust yet —
-        it records a pending commit and returns PENDING_COMMIT plus the nonce; the
-        caller sends PAIR_ACCEPT and durable trust waits for commit()."""
+        the transport authenticated. `source` (typically the remote IP) scopes the
+        wrong-guess budget: one source can spend only its own small budget, so it
+        cannot burn a legitimate user's code — a global backstop still bounds a
+        distributed attempt. On a confirmed SAS this does NOT trust yet; it records
+        a pending commit and returns PENDING_COMMIT plus the nonce."""
         now = self._clock()
         pending = self._pending
         if pending is None:
@@ -232,13 +261,22 @@ class PairingManager:
             self._pending = None
             return PairingResult(PairingOutcome.EXPIRED)
 
-        pending.attempts += 1
+        # A source that already spent its budget is refused WITHOUT consuming the
+        # code — that is the anti-grief property.
+        if pending.source_attempts.get(source, 0) >= pending.per_source_max:
+            return PairingResult(PairingOutcome.SOURCE_THROTTLED)
+
         code_ok = hmac.compare_digest(pending.code_hash, _hash_code(code))
         if not code_ok:
-            if pending.attempts >= pending.max_attempts:
-                self._pending = None
-                _log.warning("pairing code exhausted by failed attempts")
+            pending.source_attempts[source] = pending.source_attempts.get(source, 0) + 1
+            pending.global_attempts += 1
+            if pending.global_attempts >= pending.global_max:
+                self._pending = None  # global backstop: burn the code
+                _log.warning("pairing code exhausted (global attempt cap)")
                 return PairingResult(PairingOutcome.EXHAUSTED)
+            if pending.source_attempts[source] >= pending.per_source_max:
+                _log.info("pairing source throttled after failed attempts")
+                return PairingResult(PairingOutcome.SOURCE_THROTTLED)
             return PairingResult(PairingOutcome.BAD_CODE)
 
         nonce = pending.nonce
@@ -261,19 +299,32 @@ class PairingManager:
             _log.info("pairing declined at SAS ceremony for %s", redact(peer.device_id))
             return PairingResult(PairingOutcome.DENIED_BY_USER, peer)
 
-        # SAS confirmed: hold trust PENDING until the controller confirms.
-        self._pending_commit = _PendingCommit(peer=peer, nonce=nonce, created_at=now, ttl=self._ttl)
+        # SAS confirmed: hold trust PENDING until the controller confirms. The
+        # commit TTL starts NOW (after the human finished the ceremony), not at
+        # the top of handle_request — otherwise a slow SAS comparison eats the
+        # commit window.
+        self._pending_commit = _PendingCommit(
+            peer=peer, nonce=nonce, created_at=self._clock(), ttl=self._ttl
+        )
         return PairingResult(PairingOutcome.PENDING_COMMIT, peer, nonce=nonce)
 
-    def commit(self, nonce: str) -> PairingResult:
-        """Finalise durable trust on receipt of PAIR_CONFIRM carrying the nonce.
-        The host commits last so a lost/declined confirm leaves it under-trusting,
-        never over-trusting."""
+    def commit(self, peer_public_key: bytes, nonce: str) -> PairingResult:
+        """Finalise durable trust on receipt of PAIR_CONFIRM. Requires BOTH the
+        transaction nonce AND the same transport-authenticated peer key that the
+        pending commit was created for — so, like every other authority decision
+        in Portal, this is bound to the authenticated key, not to nonce
+        possession alone. The host commits last so a lost/declined confirm leaves
+        it under-trusting, never over-trusting."""
         pc = self._pending_commit
         if pc is None or pc.expired(self._clock()):
             self._pending_commit = None
             return PairingResult(PairingOutcome.NO_PENDING_COMMIT)
-        if not hmac.compare_digest(pc.nonce, nonce):
+        nonce_ok = hmac.compare_digest(pc.nonce, nonce)
+        key_ok = (
+            isinstance(peer_public_key, (bytes, bytearray))
+            and hmac.compare_digest(bytes(peer_public_key), pc.peer.public_key)
+        )
+        if not (nonce_ok and key_ok):
             return PairingResult(PairingOutcome.NO_PENDING_COMMIT)
         self._pending_commit = None
         self._store.trust(pc.peer)

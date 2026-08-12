@@ -57,7 +57,7 @@ def test_happy_path_pins_authenticated_key(tmp_path):
     assert r.peer.public_key == key
     assert r.peer.device_id == device_id_for(key)
     assert not store.is_trusted(r.peer)  # not until commit
-    committed = mgr.commit(r.nonce)
+    committed = mgr.commit(key, r.nonce)
     assert committed.outcome is PairingOutcome.ACCEPTED
     assert store.is_trusted(committed.peer)
 
@@ -80,21 +80,45 @@ def test_expiry(tmp_path):
     assert mgr.handle_request(a_key(), code, "x", confirm=YES).outcome is PairingOutcome.EXPIRED
 
 
-def test_wrong_then_exhausted(tmp_path):
-    _s, _o, mgr = host(tmp_path, max_attempts=3)
-    mgr.begin_pairing()
-    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.BAD_CODE
-    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.BAD_CODE
-    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES).outcome is PairingOutcome.EXHAUSTED
-    assert not mgr.pairing_active
-
-
-def test_correct_code_after_exhaustion_fails(tmp_path):
-    _s, _o, mgr = host(tmp_path, max_attempts=DEFAULT_MAX_ATTEMPTS)
+def test_wrong_guesses_throttle_the_source_not_the_code(tmp_path):
+    # A source spends its own budget and is throttled; the code is NOT burned, so
+    # a legitimate pairing can still complete.
+    _s, _o, mgr = host(tmp_path, per_source_attempts=3)
     code = mgr.begin_pairing()
-    for _ in range(DEFAULT_MAX_ATTEMPTS):
-        mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES)
-    assert mgr.handle_request(a_key(), code, "Leon-PC", confirm=YES).outcome is PairingOutcome.NO_ACTIVE_PAIRING
+    for _ in range(2):
+        assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES, source="1.2.3.4").outcome \
+            is PairingOutcome.BAD_CODE
+    assert mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES, source="1.2.3.4").outcome \
+        is PairingOutcome.SOURCE_THROTTLED
+    # The code is still active for everyone else.
+    assert mgr.pairing_active
+
+
+def test_attacker_source_cannot_grief_legitimate_source(tmp_path):
+    # The griefing DoS the earlier review flagged: an attacker burning guesses
+    # from their IP must not lock out the real user's IP.
+    store, _o, mgr = host(tmp_path, per_source_attempts=3)
+    code = mgr.begin_pairing()
+    for _ in range(5):  # attacker floods and gets throttled
+        mgr.handle_request(a_key(), "ZZZZ-ZZZZ", "x", confirm=YES, source="9.9.9.9")
+    # The legitimate user, from a different source, still pairs.
+    key = a_key()
+    r = mgr.handle_request(key, code, "Leon-PC", confirm=YES, source="192.168.0.50")
+    assert r.outcome is PairingOutcome.PENDING_COMMIT
+    assert mgr.commit(key, r.nonce).outcome is PairingOutcome.ACCEPTED
+
+
+def test_global_backstop_burns_code(tmp_path):
+    # A distributed attempt across many sources still hits a global cap.
+    _s, _o, mgr = host(tmp_path, per_source_attempts=2, global_attempts=6)
+    mgr.begin_pairing()
+    outcomes = []
+    for i in range(6):
+        outcomes.append(
+            mgr.handle_request(a_key(), "AAAA-AAAA", "x", confirm=YES, source=f"src-{i}").outcome
+        )
+    assert PairingOutcome.EXHAUSTED in outcomes
+    assert not mgr.pairing_active
 
 
 def test_declined_sas_does_not_pin(tmp_path):
@@ -123,44 +147,65 @@ def test_sas_is_order_independent():
     assert compute_sas(a, b) == compute_sas(b, a)
 
 
-def test_sas_is_at_least_80_bits():
-    # 80 bits = 20 hex chars, rendered in groups of 4.
+def test_sas_is_160_bits():
+    # 160-bit output -> ~80-bit generic (birthday) collision resistance.
     import secrets
 
     sas = compute_sas(secrets.token_bytes(32), secrets.token_bytes(32))
     hex_only = sas.replace("-", "")
-    assert len(hex_only) == 20  # 80 bits
+    assert len(hex_only) == 40  # 160 bits
     assert all(c in "0123456789ABCDEF" for c in hex_only)
 
 
-def test_sas_space_has_no_collisions_over_many_pairs():
-    # This test FAILS on the old 20-bit SAS (birthday collision well before 5000
-    # pairs) and passes on 80-bit. Uses raw 32-byte values, no keygen, for speed.
+def test_sas_resists_one_sided_preimage():
+    # Fixed attacker key on one leg, grind the other: a preimage search (2**n).
     import secrets
 
-    seen = set()
-    for _ in range(5000):
-        sas = compute_sas(secrets.token_bytes(32), secrets.token_bytes(32))
-        assert sas not in seen
-        seen.add(sas)
+    controller, host_k, attacker_ctrl = a_key("C"), a_key("H"), a_key("M1")
+    target = compute_sas(controller, attacker_ctrl)
+    for _ in range(100_000):
+        if compute_sas(secrets.token_bytes(32), host_k) == target:
+            raise AssertionError("one-sided collision found")
 
 
-def test_sas_resists_key_grinding_attack():
-    # The reviewer's exact attack: an active MITM fixes its controller-side key,
-    # reads the controller SAS, then grinds a host-side key until the host SAS
-    # matches. At 80 bits a bounded search finds nothing.
+def _sas_truncated(key_a: bytes, key_b: bytes, bits: int) -> int:
+    # Same construction as compute_sas, truncated, for modelling the attack at a
+    # tractable width.
+    import hashlib
+
+    lo, hi = sorted((bytes(key_a), bytes(key_b)))
+    digest = hashlib.sha256(b"portal-sas-v1" + lo + hi).digest()
+    return int.from_bytes(digest, "big") & ((1 << bits) - 1)
+
+
+def test_two_sided_claw_is_the_real_threat_model():
+    # This is the model the previous review flagged: an active MITM chooses BOTH
+    # keys and searches for SAS(C, M1) == SAS(M2, H) — a birthday/claw search at
+    # ~2**(n/2), NOT a 2**n preimage. Demonstrated at a small width so it runs
+    # fast, proving the construction has only n/2-bit collision resistance and
+    # justifying the 160-bit production output.
     import secrets
 
-    controller = a_key("C")
-    host_k = a_key("H")
-    attacker_ctrl_side = a_key("M1")
-    target = compute_sas(controller, attacker_ctrl_side)
-
+    bits = 32  # ~2**16 expected work per side — trivial
+    C, H = a_key("C"), a_key("H")
+    left: dict[int, bytes] = {}
     for _ in range(200_000):
-        candidate = secrets.token_bytes(32)
-        if compute_sas(candidate, host_k) == target:
-            raise AssertionError("SAS collision found — entropy too low")
-    # No collision in 200k tries (would be near-certain at 20 bits).
+        m1 = secrets.token_bytes(32)
+        left[_sas_truncated(C, m1, bits)] = m1
+    found = False
+    for _ in range(200_000):
+        m2 = secrets.token_bytes(32)
+        if _sas_truncated(m2, H, bits) in left:
+            found = True
+            break
+    assert found, "expected a two-sided collision at 32 bits (birthday bound)"
+
+
+def test_production_sas_output_is_160_bits():
+    # Locks the width so the collision resistance stays ~80 bits.
+    from portal.security.pairing import SAS_BYTES
+
+    assert SAS_BYTES == 20  # 160 bits
 
 
 # --- controller side + mutual pairing -------------------------------------
@@ -187,3 +232,40 @@ def test_controller_and_host_compute_same_sas(tmp_path):
 def test_generated_code_charset():
     code = generate_code()
     assert "-" in code and not any(ch in code for ch in "ILO01")
+
+
+def test_begin_pairing_refused_while_awaiting_commit(tmp_path):
+    # Finding 2: a pending commit must not silently coexist with a new pairing.
+    from portal.common.errors import PairingError
+
+    _s, _o, mgr = host(tmp_path)
+    code = mgr.begin_pairing()
+    r = mgr.handle_request(a_key(), code, "Leon-PC", confirm=YES)
+    assert r.outcome is PairingOutcome.PENDING_COMMIT
+    assert mgr.awaiting_commit
+    with pytest.raises(PairingError):
+        mgr.begin_pairing()
+    # After an explicit cancel, a fresh pairing is allowed again.
+    mgr.cancel()
+    assert isinstance(mgr.begin_pairing(), str)
+
+
+def test_slow_sas_ceremony_gets_full_commit_ttl(tmp_path):
+    # Finding 6: the commit TTL starts after the human finishes the SAS, so a
+    # slow ceremony doesn't eat the commit window.
+    store = FileIdentityStore(tmp_path / "h")
+    own = store.load_or_create("Dad").identity.public_key
+    clock = FakeClock()
+    mgr = PairingManager(store, own, clock=clock, ttl=100)
+    code = mgr.begin_pairing()
+    key = a_key()
+
+    def slow_confirm(_c):
+        clock.advance(90)  # human takes 90s comparing the SAS
+        return True
+
+    r = mgr.handle_request(key, code, "Leon", confirm=slow_confirm)
+    assert r.outcome is PairingOutcome.PENDING_COMMIT
+    # 90s elapsed during the ceremony, but the commit window is still ~100s.
+    clock.advance(50)
+    assert mgr.commit(key, r.nonce).outcome is PairingOutcome.ACCEPTED

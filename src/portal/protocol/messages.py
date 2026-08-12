@@ -200,6 +200,17 @@ class ErrorPayload(BaseModel):
     detail: str = Field(default="", max_length=MAX_ERROR_DETAIL_LEN)
 
 
+class FileOfferPayload(BaseModel):
+    """Strict wire schema for a file offer — no ad-hoc JSON, same discipline as
+    every other control message. Path-safety of the filename is enforced
+    separately at receive time (sanitize_filename); this bounds structure."""
+
+    model_config = _WIRE
+    filename: str = Field(min_length=1, max_length=255)
+    size: int = Field(ge=0, le=1 << 44)  # bounded, non-negative
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+
+
 # Registry of type -> payload model. A type absent here is KNOWN but NOT
 # ACCEPTED — the codec rejects it as unimplemented. Extend as phases land.
 PAYLOAD_SCHEMAS: dict[MessageType, type[BaseModel]] = {
@@ -216,6 +227,9 @@ PAYLOAD_SCHEMAS: dict[MessageType, type[BaseModel]] = {
     MessageType.PING: EmptyPayload,
     MessageType.PONG: EmptyPayload,
     MessageType.ERROR: ErrorPayload,
+    MessageType.FILE_OFFER: FileOfferPayload,
+    MessageType.FILE_ACCEPT: EmptyPayload,
+    MessageType.FILE_REJECT: EmptyPayload,
 }
 
 

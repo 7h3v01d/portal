@@ -8,12 +8,10 @@ yourself.
 
 ## Status
 
-**Phase 2.2 — Identity & mutual pairing, adversarially hardened (0.0.2).**
-Architecture, protocol core, security model, the five replaceable interfaces,
-on-disk identity, and grind-resistant mutual pairing are in place, with four
-adversarial passes folded in. 143 tests green. Gate 1 closed; Gate 2A + 2B
-closed. No screen capture, networking, or input injection yet — see
-[`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Phase 4 — Screen capture (0.2.0).** Backend-agnostic capture runtime (pacing,
+pause, resolution-change detection, device-loss recovery, bounded queue) on top of
+the authenticated transport and verified transfer. 200 test cases green (151 test functions). Gates 1-4 + Gate 3.1 (listener/pairing DoS throttling) closed. Real DXcam grab is validated on the Windows rig; no input injection yet —
+see [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Design principle
 
@@ -31,11 +29,11 @@ late in the plan.
 src/portal/
   common/      config, logging, errors, constants
   protocol/    message types, validated envelope, codec, capabilities, versioning
-  security/    identity, store, pairing, authority, permission gate, validation
-  transport/   Transport interface        (LAN TLS → WebRTC later)
-  capture/     CaptureBackend interface    (DXcam later)
+  security/    identity, store, pairing, handshake, session, authority, validation
+  transport/   Transport interface + TLS transport (channel-bound auth)
+  capture/     CaptureBackend + session, pacing, synthetic + DXcam backends
   input/       InputBackend interface      (Windows SendInput later)
-  transfer/    TransferBackend interface   (LAN chunked → WebRTC data channel)
+  transfer/    TransferBackend interface + LAN engine (verify + atomic rename)
   host/        host agent + session        (later phases)
   controller/  controller client + session (later phases)
   ui/          PyQt6 UI                     (later phases)

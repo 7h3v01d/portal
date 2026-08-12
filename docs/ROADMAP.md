@@ -91,7 +91,7 @@ non-string-type, deeply-nested, unknown, unimplemented, unsupported/newer,
 oversized, extra-key, coercion, non-finite, and duplicate-key messages all
 rejected with a specific ProtocolError before anything acts on them.
 
-### Phase 2 — Identity & pairing *(0.0.2 — this build, hardened in 2.1)*
+### Phase 2 — Identity & pairing *(0.0.2 — hardened through 2.3)*
 On-disk `FileIdentityStore` (atomic writes, in-process lock so a concurrent
 revoke can't be lost, private key passphrase-encryptable; public key is
 authoritative and the id is re-derived on load; malformed keys refused).
@@ -103,13 +103,18 @@ after a **Short Authentication String** ceremony.
 **Gate 2A — host trust establishment: CLOSED.** **Gate 2B — mutual end-to-end
 pairing: CLOSED** (PAIR_REQUEST → PAIR_ACCEPT → PAIR_CONFIRM through the codec).
 
-The SAS is **80 bits** (grouped hex): an active MITM that chooses the keys it
-presents cannot grind them to force both legs to a matching SAS — a shorter
-(~20-bit) SAS was demonstrably ground to a collision in seconds. Trust is
-committed with explicit **pending → commit** semantics bound by a transaction
-nonce: the controller commits first; the host — the side that will grant control
-of the machine — commits only on the final PAIR_CONFIRM, so a dropped/declined
-last step leaves the host *under*-trusting, never over-trusting.
+The SAS is **160 bits** (grouped hex). The threat is an active MITM that presents
+its own key on each leg; because it chooses BOTH keys, forging a matching SAS is a
+two-sided birthday/claw search at ~n/2, not an n-bit preimage — so 160 bits gives
+~2**80 generic collision resistance (an 80-bit SAS would give only ~2**40, which
+is feasible offline against long-lived keys). Trust is committed with explicit
+**pending → commit** semantics bound by a transaction nonce AND the authenticated
+peer key: the controller commits first; the host — the side that will grant
+control of the machine — commits only on the final PAIR_CONFIRM (matching nonce
+and same authenticated key), so a dropped/declined last step leaves the host
+*under*-trusting, never over-trusting. The 160-bit hex string is long to compare
+aloud; a PGP-style word encoding of those bits is the planned UX follow-up so the
+ceremony stays usable. The real long-term fix is an established PAKE (see below).
 
 **Known LAN limitation (documented, revisited in Phase 3):** a single global
 attempt counter means an untrusted peer can force EXHAUSTED and annoy a
@@ -124,20 +129,105 @@ ceremony; the UI is bound by this invariant. For internet pairing, use an
 established PAKE (SPAKE2+/OPAQUE) so the one-time code becomes a real secret
 rather than plaintext in transit — not a home-grown protocol.
 
-### Phase 3 — LAN file transfer *(0.1.0 — first shippable)*
-The first genuinely useful build. TLS-over-TCP transport + chunked transfer:
-offer → accept → chunk → verify. Write to `<name>.part`, verify SHA-256,
-atomically rename. Destination locked under `Downloads/Remote Transfers` via the
-Phase 0 lexical-containment gate, plus **race-safe** filesystem containment at
-the actual file-open (refuse to follow reparse points; confirm the opened handle
-resolves inside the root). **Gate 3:** 1 KB / 10 MB / multi-GB files, cancel,
-disconnect, duplicate name, hash mismatch, resume, malicious filenames, disk
-full.
+### Phase 3 — LAN file transfer *(0.1.0 — this build, first shippable)*
+The first genuinely useful build: an authenticated TLS-over-TCP transport and a
+verified file transfer.
 
-### Phase 4 — Screen capture *(0.2.0)*
-DXcam behind `CaptureBackend`: display enumeration, selection, frame timestamps,
-FPS limiting, pause. Local display of captured frames only — **no network**.
-**Gate 4:** monitor switch, resolution change, sleep/wake all survive.
+**Transport** (`transport/tls.py`) implements the provider/listener/connection
+interfaces. TLS (self-signed ephemeral certs) gives confidentiality; the real
+Ed25519 identity is authenticated *above* TLS (`security/handshake.py`) and
+**bound to the TLS channel** via `tls-unique`. This is what makes the pairing SAS
+meaningful: an active relaying MITM terminating both TLS legs cannot forward the
+real parties' authentication, because a signature made over one leg's binding
+fails on the other — verified end-to-end against a real relaying attacker. So the
+MITM is forced to present its own key, which the SAS then catches. Framing is
+`tag||length||body` with the length checked against the per-channel ceiling
+before the body is read. `security/session.py` classifies the authenticated key
+against the trust store (trusted → session; unknown → pairing only).
+
+**Transfer** (`transfer/lan.py`): offer → attended approve → validate filename →
+race-safe `<name>.part` open (nofollow + exclusive, under the fixed transfer root)
+→ verify SHA-256 → atomic rename. The receiver chooses the destination; a hash
+mismatch, oversize, decline, disconnect, or capability revocation discards the
+partial file and nothing unverified ever appears under the final name.
+
+**Gate 3 — covered by tests:** verified happy path (incl. 1 MiB over real TLS),
+hash-mismatch discard, malicious/traversal filename refusal, containment, size
+overflow, decline, and mid-stream revocation abort.
+**Deferred to hardware validation / follow-up:** multi-GB streaming and memory
+bound, resume after disconnect, disk-full handling, and pairing-mode connection
+throttling (the real listener now exists, so source/rate throttling is the next
+DoS item).
+
+### Phase 4 — Screen capture *(0.2.0 — this build)*
+Screen capture split into backend-agnostic runtime (tested on any OS) and a thin
+Windows adapter (validated on the rig). `CaptureSession` owns pacing (FPS limit
+via a pure, clock-injected `FrameClock`), pause/resume, resolution/monitor-change
+detection (`on_display_change`), device-loss recovery (restart on a backend error
+from sleep/wake or monitor switch), frame timestamping, and a **bounded
+drop-oldest queue** so a slow consumer can't grow memory (ahead of Phase 5's
+gate). `SyntheticCaptureBackend` generates frames in memory so this pipeline —
+and the Phase 5 encoder and Phase 6 viewer — can be built without Windows.
+`DxcamCaptureBackend` is the real Desktop Duplication adapter (BGRA, Windows-only,
+`capture` extra). **Local frames only — no network.**
+
+**Gate 4 — covered by tests (synthetic backend):** enumeration, pause, resolution
+change fires the callback, device-loss recovery, frame timestamps, bounded queue,
+full paced loop.
+**Deferred to hardware validation:** real DXcam grab on the rig, actual
+monitor-switch / sleep-wake device-loss, and true multi-monitor geometry.
+
+### Phase 4.1 — Seam hardening *(0.2.0)*
+Fixes from the adversarial pass, all at module seams:
+- **Transfer authority (was fail-open):** capability tokens are now mandatory AND
+  capability-specific — `receive_file` requires `file.write.inbound`,
+  `send_file` requires `file.read.outbound`. A token for an unrelated capability
+  (e.g. `screen.publish`) is refused before any I/O. This is the authority
+  wrapper the model depends on.
+- **Transport resource bounds:** control/bulk/accept queues are bounded (control
+  overflow closes the connection; bulk applies TCP backpressure), and the auth
+  handshake has a timeout — an authenticated-but-untrusted peer can no longer
+  flood memory or tie up the listener.
+- **Disconnect discards pending work:** on connection death the queues are
+  cleared and waiters raise immediately, rather than draining a backlog of
+  now-stale (soon: privileged) commands — important before input injection.
+- **Capture recovery is genuinely bounded:** consecutive failures are counted and
+  reset only by a *successful frame*, with backoff/yield, so a backend that fails
+  every grab terminates instead of spinning the event loop; the session has a
+  terminal state so `get()` raises instead of hanging.
+- **Transfer control on the strict codec:** FILE_OFFER/ACCEPT/REJECT are real
+  Portal messages now, not ad-hoc JSON — no coercion, no extra fields.
+- **No silent overwrite:** an existing destination is preserved; the incoming
+  file lands as `name (1).ext`.
+
+### Gate 3.1 — Listener & pairing DoS throttling *(blocking, near-term)*
+The real TLS listener now exists (Phase 3), so unauthenticated/untrusted inbound
+connection abuse is a live risk, not a future one. Before Phase 6 exposes a
+long-lived listening session, this gate must close:
+- per-source connection rate limiting (cap concurrent + new-per-window by peer IP);
+- a global cap on in-flight (pre-accept) handshakes beyond the existing accept
+  queue bound;
+- pairing-mode hardening: a single global attempt counter currently lets an
+  untrusted peer force EXHAUSTED and grief a legitimate pairing — scope attempts
+  per source and rate-limit `begin_pairing`/inbound pair requests.
+The rate-limiter logic is pure and unit-testable now; the socket wiring lands
+with the listener work.
+
+### Gate 3.1 — Listener & pairing DoS throttling *(CLOSED)*
+The live-since-Phase-3 exposure, now closed:
+- **Connection admission throttle** (`transport/throttle.py`, pure + clock-injected):
+  per-source sliding-window rate limit, per-source concurrent-handshake cap, and a
+  global in-flight cap. Wired into the TLS listener keyed by peer IP; a slot is
+  held only for the handshake window, and a flood is dropped before a handshake is
+  spent on it (verified: 12 rapid connections from one source admit only the rate
+  budget).
+- **Pairing attempts scoped per source:** a source spends only its own small
+  wrong-guess budget (throttled after that) while the code stays alive for others;
+  a global backstop still burns the code under a distributed attempt. This closes
+  the grief-DoS where one bad source could exhaust a legitimate user's pairing
+  (verified: attacker from one IP throttled, real user from another still pairs).
+The socket wiring passes the remote IP through as the throttle/attempt key; the
+rate-limiter and attempt logic are unit-tested independently.
 
 ### Phase 5 — Video pipeline *(0.2.0)*
 PyAV encode. First target 1280×720@15, then 1080p@30. Measure capture/encode/
@@ -150,11 +240,28 @@ Wire the video track through the transport to a PyQt6 viewer (dark-industrial).
 intentional.
 
 ### Phase 7 — Remote mouse *(0.4.0 — MVP complete)*
-Control events over the data channel using normalised 0.0–1.0 coordinates. Every
-event passes the `PermissionGate` (`input.inject.mouse`) before reaching
-SendInput.
-Emergency host-side kill (Ctrl+Alt+Shift+F12) revokes all capabilities
-instantly. **Gate 7:** scaling, multi-resolution, multi-monitor, and — the ones
+Control events over the data channel using normalised 0.0–1.0 coordinates.
+
+**Blocking precondition — input-injection design review (do BEFORE writing any
+SendInput code):**
+- capability is re-checked **per event**, not once per session — a mid-stream
+  revoke must stop the very next event (the authority generation/token model
+  already supports this; the input path must actually use it);
+- coordinate mapping is DPI-aware and correct across multi-monitor virtual-desktop
+  geometry, so a normalised point can't land on the wrong screen or off-target;
+- the emergency kill (Ctrl+Alt+Shift+F12 → `revoke_all`) must be reachable even
+  while remote input is active, and its limitations on the secure desktop / UAC
+  prompts documented — the operator must never be locked out of their own machine.
+
+**Blocking precondition — Windows-native containment (carried from Phase 3):**
+before input injection or unattended file writes, the receiver's file-open must be
+reparse-point-proof on Windows (native handle validation, not just lexical
+containment + `O_EXCL`, which is all POSIX `O_NOFOLLOW` gives and is a no-op on
+Windows). Symlink/junction redirection of a received file is not acceptable once
+the tool can also drive the machine.
+
+Every event passes the `PermissionGate` (`input.inject.mouse`) before reaching
+SendInput. **Gate 7:** scaling, multi-resolution, multi-monitor, and — the ones
 that matter — disconnect and revocation stop input *immediately*.
 
 ## MVP definition
@@ -165,6 +272,25 @@ that matter — disconnect and revocation stop input *immediately*.
 
 When that passes its gates, Portal is a real remote-support tool, not a tech
 demo — and internet rendezvous becomes an extension rather than a gamble.
+
+## Blocking gate conditions (carried risks that must not slip)
+
+These are known-deferred risks promoted to explicit blockers, each pinned to the
+phase that may not ship without it. They are tracked here, in one place, precisely
+so schedule pressure can't quietly downgrade them to "later".
+
+| # | Condition | Blocks | Status |
+|---|-----------|--------|--------|
+| B1 | **Windows-native reparse-point-proof file-open** (not just lexical + `O_EXCL`; `O_NOFOLLOW` is a no-op on Windows) | Phase 7 (input/unattended writes) | open, Windows-only |
+| B2 | **Listener & pairing DoS throttling** — per-source connection + pair-request rate limiting; scope pairing attempts per source | Phase 6 (long-lived listener) | **CLOSED (Gate 3.1)** |
+| B3 | **Private key at rest** — OS-native protection (Windows DPAPI / keyring), not plaintext-with-warning | any "install and forget" / unattended UX | open, Windows-only |
+| B4 | **Concurrency ownership** for `SessionAuthority` / trust store — documented single-owner model or explicit synchronisation before multi-session/threaded use | multi-session work | store lock done in-process; authority ownership to document |
+| B5 | **Input-injection design review** — per-event capability re-check, DPI/multi-monitor coordinate correctness, kill-switch reachable on secure desktop | Phase 7 (before any SendInput) | required precondition |
+
+None of these is a current defect (the Phase 4.1 pass closed the live bugs); they
+are forward risks whose cost rises the later they are addressed. B1, B3, and B5
+are Windows-runtime concerns validated on the rig; B2's rate-limiter and B4's
+ownership contract are testable now.
 
 ## Deferred (post-MVP, the back half of the full plan)
 

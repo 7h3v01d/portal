@@ -140,3 +140,4 @@ def ensure_display_text(value: str) -> str:
         if ch in _BIDI_CONTROLS:
             raise UnsafePathError("display text contains bidirectional-control characters")
     return value
+

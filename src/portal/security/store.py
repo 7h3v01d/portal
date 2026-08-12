@@ -35,9 +35,11 @@ from pathlib import Path
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from ..common.errors import IdentityError
+from ..common.constants import MAX_DEVICE_NAME_LEN
+from ..common.errors import IdentityError, UnsafePathError
 from ..common.logging import get_logger
 from .identity import DeviceIdentity, Ed25519Identity, IdentityStore, verify_pinned
+from .validation import ensure_display_text
 
 _log = get_logger("security.store")
 
@@ -178,25 +180,49 @@ class FileIdentityStore(IdentityStore):
         for row in rows:
             try:
                 public_key = bytes.fromhex(row["public_key"])
-                # Public key is authoritative: derive the id from it rather than
-                # trusting the stored device_id, and reject any row whose key is
-                # not canonical 32-byte material (DeviceIdentity validates length).
-                out.append(
-                    DeviceIdentity.from_public_key(
-                        public_key, device_name=str(row.get("device_name", ""))
-                    )
-                )
-            except (KeyError, ValueError, TypeError, IdentityError):
-                continue  # skip malformed rows rather than trusting them
+                # Peer display names get the SAME treatment as wire names: a
+                # tampered/corrupt record must not reintroduce newline/control/bidi
+                # injection that the wire layer forbids. Validate, don't coerce.
+                name = row.get("device_name", "")
+                if not isinstance(name, str):
+                    continue
+                name = ensure_display_text(name)
+                if len(name) > MAX_DEVICE_NAME_LEN:
+                    continue
+                # Public key is authoritative: derive the id from it, and reject
+                # any row whose key is not canonical 32-byte material.
+                out.append(DeviceIdentity.from_public_key(public_key, name))
+            except (KeyError, ValueError, TypeError, IdentityError, UnsafePathError):
+                continue  # skip malformed/unsafe rows rather than trusting them
+        return out
+
+    def _existing_added_at(self) -> dict[str, int]:
+        """Map public-key-hex -> original added_at from the current file, so a
+        rewrite preserves when each peer was actually added rather than stamping
+        them all with 'now'."""
+        try:
+            rows = json.loads(self._trusted_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(rows, list):
+            return {}
+        out: dict[str, int] = {}
+        for row in rows:
+            try:
+                out[row["public_key"]] = int(row["added_at"])
+            except (KeyError, ValueError, TypeError):
+                continue
         return out
 
     def _save_trusted(self, peers: list[DeviceIdentity]) -> None:
+        existing = self._existing_added_at()
+        now = int(time.time())
         rows = [
             {
                 "device_id": p.device_id,
                 "device_name": p.device_name,
                 "public_key": p.public_key.hex(),
-                "added_at": int(time.time()),
+                "added_at": existing.get(p.public_key.hex(), now),  # preserve original
             }
             for p in sorted(peers, key=lambda p: p.public_key.hex())
         ]

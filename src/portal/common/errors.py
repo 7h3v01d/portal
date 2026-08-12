@@ -53,6 +53,11 @@ class IdentityError(SecurityError):
     """Key generation, signing, or verification failed."""
 
 
+class PairingError(SecurityError):
+    """A pairing operation was attempted from an invalid state (e.g. starting a
+    new pairing while one is still awaiting commit)."""
+
+
 class UnsafePathError(SecurityError):
     """A filename or destination failed containment validation."""
 

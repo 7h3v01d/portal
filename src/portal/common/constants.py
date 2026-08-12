@@ -21,6 +21,27 @@ MAX_CONTROL_MESSAGE_BYTES = 64 * 1024  # 64 KiB
 # cheap crash primitive (RecursionError), so we reject before parsing.
 MAX_JSON_DEPTH = 16
 
+# Transport resource bounds. Individual frames are size-capped, but the *number*
+# of buffered frames must be bounded too, or an authenticated-but-untrusted peer
+# can flood memory before any trust check runs.
+CONTROL_QUEUE_MAX = 64        # control frames buffered; overflow = violation -> close
+BULK_QUEUE_MAX = 8            # bulk frames buffered; overflow applies backpressure
+ACCEPT_QUEUE_MAX = 16         # pending authenticated connections awaiting accept()
+HANDSHAKE_TIMEOUT_SECONDS = 10.0  # a peer must complete the auth handshake within this
+
+# Connection admission throttling (Gate 3.1). Defaults tuned for a LAN family
+# tool: generous for a real user, tight enough to blunt a flood.
+CONN_RATE_PER_SOURCE = 20        # new connections per source per window
+CONN_RATE_WINDOW_SECONDS = 10.0
+CONN_CONCURRENT_PER_SOURCE = 5   # simultaneous in-handshake connections per source
+CONN_INFLIGHT_GLOBAL_MAX = 64    # global cap on connections currently handshaking
+
+# Pairing attempt scoping (Gate 3.1). A single source gets a small budget of wrong
+# guesses; a global backstop bounds a distributed attempt. Neither lets one source
+# burn a legitimate pairing.
+PAIR_ATTEMPTS_PER_SOURCE = 5
+PAIR_ATTEMPTS_GLOBAL_MAX = 50
+
 # Per-field wire limits. The 64 KiB envelope ceiling is not enough on its own —
 # a hostile peer could still send one field that is 60 KiB of garbage. These cap
 # the individual fields a strict model can't otherwise bound.

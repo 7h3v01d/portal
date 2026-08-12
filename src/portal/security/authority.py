@@ -26,8 +26,16 @@ through `grant`/`revoke`/`revoke_all` here, so a revoke can never happen without
 bumping the relevant generation. Reading is via `has`/`granted` (a frozenset
 copy), never the live set.
 
-**Concurrency contract.** Owned by a single event loop / thread; not internally
-synchronised."""
+**Concurrency contract (B4).** A SessionAuthority instance is owned by exactly
+one session on exactly one event loop, and is NOT internally synchronised: `grant`
+/`revoke`/`revoke_all`/`authorize` and every token `.valid` read must happen on
+that owning loop. `revoke` then bumping a generation is two operations; a reader
+on another thread could observe the gap and act on stale authority. Do not share
+one authority across sessions or threads. When session handling becomes multi-
+threaded, either confine all authority mutation to the owning loop via
+`call_soon_threadsafe`-style marshalling, or introduce explicit locking — this is
+a tracked blocking condition (B5/B4 in the roadmap) before any such use, and in
+particular before input injection reads authority on a hot path."""
 
 from __future__ import annotations
 

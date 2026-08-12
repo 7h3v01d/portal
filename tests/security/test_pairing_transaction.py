@@ -62,7 +62,7 @@ def test_mutual_pairing_over_the_codec(tmp_path: Path):
     )))
 
     # Host commits durable trust only now.
-    committed = host_mgr.commit(conf.payload.nonce)
+    committed = host_mgr.commit(ctrl_key, conf.payload.nonce)
     assert committed.outcome is PairingOutcome.ACCEPTED
     assert host_store.is_trusted(committed.peer)
 
@@ -103,12 +103,27 @@ def test_commit_rejects_wrong_nonce(tmp_path: Path):
     mgr = PairingManager(host_store, host_key)
     code = mgr.begin_pairing()
     r = mgr.handle_request(ctrl_key, code, "Leon-PC", confirm=YES)
-    bad = mgr.commit("f" * 32)
+    bad = mgr.commit(ctrl_key, "f" * 32)
     assert bad.outcome is PairingOutcome.NO_PENDING_COMMIT
     assert not host_store.is_trusted(r.peer)
     # The correct nonce still works afterwards.
-    good = mgr.commit(r.nonce)
+    good = mgr.commit(ctrl_key, r.nonce)
     assert good.outcome is PairingOutcome.ACCEPTED
+
+
+def test_commit_rejects_wrong_peer_key(tmp_path: Path):
+    # Finding 3: a correct nonce from a DIFFERENT authenticated key must not
+    # finalise trust — commit is bound to the pending peer's key.
+    host_store = FileIdentityStore(tmp_path / "host")
+    host_key = host_store.load_or_create("Dad-PC").identity.public_key
+    ctrl_key = Ed25519Identity.generate("Leon-PC").identity.public_key
+    other_key = Ed25519Identity.generate("Someone-Else").identity.public_key
+    mgr = PairingManager(host_store, host_key)
+    code = mgr.begin_pairing()
+    r = mgr.handle_request(ctrl_key, code, "Leon-PC", confirm=YES)
+    wrong_peer = mgr.commit(other_key, r.nonce)  # right nonce, wrong key
+    assert wrong_peer.outcome is PairingOutcome.NO_PENDING_COMMIT
+    assert not host_store.is_trusted(r.peer)
 
 
 def test_pair_deny_transaction(tmp_path: Path):
