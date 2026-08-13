@@ -265,8 +265,31 @@ validated on the rig; all the real logic is in ScreenViewer and tested here.
 libx264 → TLS → real decode → RGB frames), wire-codec round-trip + bad-magic/short
 rejection, decoder waits-for-keyframe resync, publish requires `screen.publish`
 (wrong capability denied), and **instant revocation stops the stream**.
-**Deferred to hardware validation:** the Qt render surface and end-to-end
-glass-to-glass latency on the rig with real DXcam frames.
+**Gate 6 — REOPENED (Phase 6.1 hardening in progress).** The full loop works and
+is tested, but an adversarial pass found the "instant revocation" claim was a
+TOCTOU (a frame could ship after revoke landed during a pending `await`). Fixed
+in A2 with this invariant: *authority is re-checked after any suspension point
+that precedes an authority-sensitive side effect, and long-running waits are
+raced against revocation where prompt termination is required.* `CancellationToken`
+is now cancellation-aware (`wait_invalid()`, plus a token-local cancel event), and
+both screen publish and file receive race their blocking awaits against it, so a
+revoke both prevents the side effect AND terminates the operation without the peer
+having to cooperate. Regression tests are write-spy / event-synchronised and
+revert-proven (they fail against the pre-fix code) for both paths. Gate 6 stays
+open until the rest of the 6.1 pass (A1 pre-TLS admission, A3 composed authority
+path, A5 decode ceilings) closes.
+
+**A4 — control-plane starvation: FIXED.** Video moved to a dedicated LOSSY channel
+(`send_video`/`recv_video`): a bounded drop-oldest buffer the reader never blocks
+on, so a slow/absent video consumer can no longer suspend the reader and starve
+control frames (stop / revoke / emergency kill). File bulk stays reliable
+(backpressure). Regression is the reviewer's own reproduction — flood video, then
+an urgent control frame still arrives — and it is revert-proven (times out against
+the old blocking path). Residual, documented: a concurrent *saturating file
+transfer* can still delay control via bulk backpressure; the full fix (per-stream
+/ separate control transport) is tracked for the internet-transport phase, but the
+Phase 7 danger path (screen video + input control, no required concurrent file) is
+now starvation-free.
 
 ### Phase 7 — Remote mouse *(0.4.0 — MVP complete)*
 Control events over the data channel using normalised 0.0–1.0 coordinates.

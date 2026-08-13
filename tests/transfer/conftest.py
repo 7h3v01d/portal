@@ -6,6 +6,7 @@ without real sockets while still honouring the exact interface contract."""
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 
 from portal.transport.base import TransportConnection
 
@@ -15,13 +16,17 @@ class MemoryConnection(TransportConnection):
         self._peer_key = peer_key
         self._in_control: asyncio.Queue[bytes] = asyncio.Queue()
         self._in_bulk: asyncio.Queue[bytes] = asyncio.Queue()
+        self._in_video: deque[bytes] = deque(maxlen=4)
+        self._video_available = asyncio.Event()
         self._out_control: asyncio.Queue[bytes] | None = None
         self._out_bulk: asyncio.Queue[bytes] | None = None
+        self._out_video: "MemoryConnection | None" = None
         self._closed = False
 
     def link(self, other: "MemoryConnection") -> None:
         self._out_control = other._in_control
         self._out_bulk = other._in_bulk
+        self._out_video = other
 
     @property
     def peer_public_key(self) -> bytes:
@@ -42,6 +47,18 @@ class MemoryConnection(TransportConnection):
 
     async def recv_bulk(self) -> bytes:
         return await self._in_bulk.get()
+
+    async def send_video(self, data: bytes) -> None:
+        # drop-oldest, never blocks (mirrors the real transport contract)
+        self._out_video._in_video.append(bytes(data))
+        self._out_video._video_available.set()
+
+    async def recv_video(self) -> bytes:
+        while True:
+            if self._in_video:
+                return self._in_video.popleft()
+            self._video_available.clear()
+            await self._video_available.wait()
 
     async def close(self) -> None:
         self._closed = True

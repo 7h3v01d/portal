@@ -57,6 +57,25 @@ def _require_capability(token: CancellationToken, expected: Capability) -> None:
         raise PermissionDeniedError(f"capability {expected} is not currently authorised")
 
 
+async def _recv_bulk_or_revoked(conn: TransportConnection, token: CancellationToken) -> bytes | None:
+    """await recv_bulk, but abort promptly if the token is revoked — so a revoke
+    terminates the receive even if the (now-untrusted) peer sends nothing more.
+    Returns the chunk, or None if revoked while waiting."""
+    import asyncio
+
+    recv = asyncio.ensure_future(conn.recv_bulk())
+    rev = asyncio.ensure_future(token.wait_invalid())
+    try:
+        done, _pending = await asyncio.wait({recv, rev}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in (recv, rev):
+            if not t.done():
+                t.cancel()
+    if recv in done and token.valid:
+        return recv.result()
+    return None
+
+
 def _hash_file(path: Path) -> tuple[str, int]:
     h = hashlib.sha256()
     size = 0
@@ -152,11 +171,18 @@ async def receive_file(
     try:
         with os.fdopen(fd, "wb") as out:
             while True:
-                if not token.valid:
+                # Race the receive against revocation: a revoke both prevents the
+                # write (side-effect safety) AND terminates the operation without
+                # needing the untrusted peer to send anything (liveness).
+                chunk = await _recv_bulk_or_revoked(conn, token)
+                if chunk is None:
                     raise TransferError("transfer authority revoked")
-                chunk = await conn.recv_bulk()
                 if chunk == b"":  # end-of-stream
                     break
+                # Belt-and-braces: re-check before the privileged write in case the
+                # race resolved to a chunk in the same tick a revoke landed.
+                if not token.valid:
+                    raise TransferError("transfer authority revoked")
                 written += len(chunk)
                 if written > offer.size:
                     raise TransferError("sender exceeded declared size")

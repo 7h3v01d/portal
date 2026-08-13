@@ -25,7 +25,8 @@ MAX_JSON_DEPTH = 16
 # of buffered frames must be bounded too, or an authenticated-but-untrusted peer
 # can flood memory before any trust check runs.
 CONTROL_QUEUE_MAX = 64        # control frames buffered; overflow = violation -> close
-BULK_QUEUE_MAX = 8            # bulk frames buffered; overflow applies backpressure
+BULK_QUEUE_MAX = 8            # bulk (file) frames buffered; overflow applies backpressure
+VIDEO_QUEUE_MAX = 4           # video frames buffered; drop-oldest, reader never blocks
 ACCEPT_QUEUE_MAX = 16         # pending authenticated connections awaiting accept()
 HANDSHAKE_TIMEOUT_SECONDS = 10.0  # a peer must complete the auth handshake within this
 

@@ -72,9 +72,18 @@ def test_request_keyframe_forces_idr():
         for _ in range(5):
             enc.encode(_bgra_frame(320, 240))
         enc.request_keyframe()
-        pkts = enc.encode(_bgra_frame(320, 240))
-        # zerolatency -> immediate output; the forced frame should be a keyframe.
-        assert any(p.is_keyframe for p in pkts) or True  # tolerate encoder buffering
+        # Feed frames until the forced IDR appears, tolerating encoder buffering
+        # up to a strict bound. A real assertion: fails if no keyframe ever comes.
+        saw_keyframe = False
+        for _ in range(10):
+            pkts = enc.encode(_bgra_frame(320, 240))
+            if any(p.is_keyframe for p in pkts):
+                saw_keyframe = True
+                break
+        pkts = enc.flush()
+        if any(p.is_keyframe for p in pkts):
+            saw_keyframe = True
+        assert saw_keyframe, "request_keyframe() did not produce an IDR within the bound"
     finally:
         enc.close()
 

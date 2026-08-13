@@ -76,12 +76,28 @@ class TransportConnection(ABC):
 
     @abstractmethod
     async def send_bulk(self, data: bytes) -> None:
-        """Send one bulk frame (e.g. a file chunk). Back-pressured by the impl."""
+        """Send one bulk frame (e.g. a file chunk). Back-pressured by the impl.
+        Bulk is RELIABLE — never dropped — so it is used for file data that must
+        arrive intact."""
 
     @abstractmethod
     async def recv_bulk(self) -> bytes:
         """Receive one bulk frame. MUST reject a declared frame length >
         MAX_BULK_FRAME_BYTES before allocating for it."""
+
+    @abstractmethod
+    async def send_video(self, data: bytes) -> None:
+        """Send one video frame. The video channel is LOSSY by contract: the
+        receiver keeps only the most recent frames (drop-oldest) and the reader
+        NEVER blocks on it. This is what stops a slow/absent video consumer from
+        starving the control plane — an emergency stop/revoke must never be stuck
+        behind a backlog of stale video (A4)."""
+
+    @abstractmethod
+    async def recv_video(self) -> bytes:
+        """Receive the next available video frame (older frames may have been
+        dropped). MUST reject a declared length > MAX_BULK_FRAME_BYTES before
+        allocating."""
 
     @abstractmethod
     async def close(self) -> None:

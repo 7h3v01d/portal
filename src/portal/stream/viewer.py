@@ -93,7 +93,7 @@ class ScreenViewer:
     async def _run(self) -> None:
         try:
             while self._running:
-                raw = await self._conn.recv_bulk()  # raises on disconnect
+                raw = await self._conn.recv_video()  # raises on disconnect
                 packet = unpack_packet(raw)
                 for frame in self._decoder.decode(packet.data, packet.is_keyframe, packet.timestamp_ns):
                     self._enqueue(frame)

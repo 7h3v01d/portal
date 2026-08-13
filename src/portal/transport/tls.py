@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import ssl
+from collections import deque
 
 from ..common.constants import (
     ACCEPT_QUEUE_MAX,
@@ -32,6 +33,7 @@ from ..common.constants import (
     HANDSHAKE_TIMEOUT_SECONDS,
     MAX_BULK_FRAME_BYTES,
     MAX_CONTROL_MESSAGE_BYTES,
+    VIDEO_QUEUE_MAX,
 )
 from ..common.errors import TransportError
 from ..common.logging import get_logger
@@ -45,6 +47,7 @@ _log = get_logger("transport.tls")
 
 _TAG_CONTROL = 0
 _TAG_BULK = 1
+_TAG_VIDEO = 2
 _LEN_PREFIX = 4
 _AUTH_FRAME_MAX = 4096  # the auth handshake message is tiny
 
@@ -64,7 +67,7 @@ async def _read_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
     header = await _read_exactly(reader, 1 + _LEN_PREFIX)
     tag = header[0]
     length = int.from_bytes(header[1 : 1 + _LEN_PREFIX], "big")
-    if tag not in (_TAG_CONTROL, _TAG_BULK):
+    if tag not in (_TAG_CONTROL, _TAG_BULK, _TAG_VIDEO):
         raise TransportError(f"unknown channel tag {tag}")
     if length > _limit_for(tag):  # ceiling BEFORE allocating/reading the body
         raise TransportError(f"frame length {length} exceeds limit for channel {tag}")
@@ -90,6 +93,10 @@ class TlsConnection(TransportConnection):
         # memory by sending frames faster than we consume them.
         self._control: asyncio.Queue[bytes] = asyncio.Queue(maxsize=CONTROL_QUEUE_MAX)
         self._bulk: asyncio.Queue[bytes] = asyncio.Queue(maxsize=BULK_QUEUE_MAX)
+        # Video is LOSSY: a bounded drop-oldest buffer the reader never blocks on,
+        # so a slow/absent video consumer can never starve the control plane (A4).
+        self._video: deque[bytes] = deque(maxlen=VIDEO_QUEUE_MAX)
+        self._video_available = asyncio.Event()
         self._closed = False
         self._error: Exception | None = None
         self._closed_event = asyncio.Event()
@@ -112,9 +119,18 @@ class TlsConnection(TransportConnection):
                         self._control.put_nowait(body)  # control should not back up
                     except asyncio.QueueFull:
                         raise TransportError("control queue overflow — closing connection")
+                elif tag == _TAG_VIDEO:
+                    # Never block on video: drop-oldest. This is the A4 guarantee —
+                    # a slow video consumer cannot suspend the reader and thereby
+                    # starve control-plane frames (stop / revoke / emergency kill).
+                    self._video.append(body)
+                    self._video_available.set()
                 else:
-                    # Bulk applies backpressure: awaiting a full queue stops us
-                    # reading the socket, throttling the sender at the TCP layer.
+                    # File bulk is reliable: backpressure the sender at the TCP
+                    # layer by awaiting a full queue. (During screen sharing there
+                    # is no concurrent file bulk, so the reader never blocks and
+                    # control is never starved; concurrent saturating file + control
+                    # is addressed by the future per-stream transport split.)
                     await self._bulk.put(body)
         except Exception as exc:  # noqa: BLE001
             self._error = exc
@@ -128,6 +144,8 @@ class TlsConnection(TransportConnection):
         self._closed = True
         _drain(self._control)
         _drain(self._bulk)
+        self._video.clear()
+        self._video_available.set()
         self._closed_event.set()
 
     async def _send(self, tag: int, data: bytes) -> None:
@@ -168,6 +186,27 @@ class TlsConnection(TransportConnection):
 
     async def recv_bulk(self) -> bytes:
         return await self._recv(self._bulk)
+
+    async def send_video(self, data: bytes) -> None:
+        await self._send(_TAG_VIDEO, data)
+
+    async def recv_video(self) -> bytes:
+        """Return the next available video frame. Older frames may have been
+        dropped (the buffer is drop-oldest); the consumer wants the latest."""
+        while True:
+            if self._closed:
+                raise TransportError(self._error and str(self._error) or "connection closed")
+            if self._video:
+                return self._video.popleft()
+            self._video_available.clear()
+            wait_task = asyncio.ensure_future(self._video_available.wait())
+            closed_task = asyncio.ensure_future(self._closed_event.wait())
+            try:
+                await asyncio.wait({wait_task, closed_task}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for t in (wait_task, closed_task):
+                    if not t.done():
+                        t.cancel()
 
     async def close(self) -> None:
         self._mark_closed()

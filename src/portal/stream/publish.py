@@ -47,11 +47,15 @@ class ScreenPublisher:
         """Wait for STREAM_START, then publish until stop/revoke/disconnect."""
         self._require_publish()
 
-        msg = decode(await conn.recv_control())
-        if msg.type is not MessageType.STREAM_START:
+        # Race the (possibly long) STREAM_START wait against revocation so a
+        # revoke here doesn't let us start capture/encode on stale authority.
+        started = await self._recv_control_or_revoked(conn)
+        if started is None or started.type is not MessageType.STREAM_START:
             return
-        fps = msg.payload.fps
-        bitrate = msg.payload.bitrate
+        if not self._token.valid:  # re-check after the await, before any side effect
+            return
+        fps = started.payload.fps
+        bitrate = started.payload.bitrate
 
         await self._capture.start()
         pipeline = EncodePipeline(self._capture, self._encoder, width=width, height=height,
@@ -65,17 +69,53 @@ class ScreenPublisher:
         control_task = asyncio.create_task(self._control_loop(conn, pipeline))
         try:
             while not self._stop.is_set():
-                if not self._token.valid:  # instant revocation
+                if not self._token.valid:  # instant revocation (pre-await)
                     _log.info("screen.publish revoked — stopping stream")
                     break
-                packet = await pipeline.get()  # raises if pipeline terminates
-                await conn.send_bulk(pack_packet(packet))
+                packet = await self._get_frame_or_revoked(pipeline)
+                if packet is None:  # revoked while awaiting a frame
+                    _log.info("screen.publish revoked during frame wait — stopping")
+                    break
+                # CRITICAL: re-check AFTER the await and BEFORE the privileged send.
+                # Without this, a revoke landing during get() still ships one frame.
+                if not self._token.valid:
+                    _log.info("screen.publish revoked before send — dropping frame")
+                    break
+                await conn.send_video(pack_packet(packet))
         except Exception:  # noqa: BLE001 — disconnect / pipeline terminal
             pass
         finally:
             control_task.cancel()
             await pipeline.stop()
             await self._capture.stop()
+
+    async def _recv_control_or_revoked(self, conn: TransportConnection):
+        """await recv_control, but abort promptly if the token is revoked."""
+        recv = asyncio.ensure_future(conn.recv_control())
+        rev = asyncio.ensure_future(self._token.wait_invalid())
+        try:
+            done, _pending = await asyncio.wait({recv, rev}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (recv, rev):
+                if not t.done():
+                    t.cancel()
+        if recv in done and self._token.valid:
+            return decode(recv.result())
+        return None
+
+    async def _get_frame_or_revoked(self, pipeline: EncodePipeline):
+        """await the next packet, but abort promptly if the token is revoked."""
+        get = asyncio.ensure_future(pipeline.get())
+        rev = asyncio.ensure_future(self._token.wait_invalid())
+        try:
+            done, _pending = await asyncio.wait({get, rev}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in (get, rev):
+                if not t.done():
+                    t.cancel()
+        if get in done and self._token.valid:
+            return get.result()
+        return None
 
     async def _control_loop(self, conn: TransportConnection, pipeline: EncodePipeline) -> None:
         try:

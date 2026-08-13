@@ -137,6 +137,43 @@ async def test_queued_frames_discarded_on_death():
 
 
 @pytest.mark.asyncio
+async def test_video_flood_does_not_starve_control():
+    # A4: the reviewer's reproduction. Saturate the video channel with far more
+    # frames than the buffer holds, then send an urgent control frame. Because
+    # video is drop-oldest and never blocks the reader, control still arrives.
+    host = Ed25519Identity.generate("Dad")
+    ctrl = Ed25519Identity.generate("Leon")
+    server_conn, client_conn, listener = await _pair(host, ctrl)
+    try:
+        for i in range(200):
+            await client_conn.send_video(f"video-{i}".encode())
+        await client_conn.send_control(b"URGENT-STOP")  # think: emergency revoke
+        got = await asyncio.wait_for(server_conn.recv_control(), timeout=2.0)
+        assert got == b"URGENT-STOP"
+    finally:
+        await client_conn.close()
+        await server_conn.close()
+        await listener.close()
+
+
+@pytest.mark.asyncio
+async def test_video_is_lossy_latest_wins():
+    host = Ed25519Identity.generate("Dad")
+    ctrl = Ed25519Identity.generate("Leon")
+    server_conn, client_conn, listener = await _pair(host, ctrl)
+    try:
+        for i in range(100):
+            await client_conn.send_video(f"f{i}".encode())
+        await asyncio.sleep(0.1)
+        frame = await asyncio.wait_for(server_conn.recv_video(), timeout=2.0)
+        assert int(frame.decode()[1:]) >= 90  # a recent frame, not frame 0
+    finally:
+        await client_conn.close()
+        await server_conn.close()
+        await listener.close()
+
+
+@pytest.mark.asyncio
 async def test_listener_throttles_connection_flood(monkeypatch):
     # Gate 3.1: a flood of connections from one source is admitted only up to the
     # rate budget; the rest are dropped before completing a handshake.
