@@ -43,13 +43,18 @@ class ScreenPublisher:
         if not self._token.valid:
             raise PermissionDeniedError("screen.publish is not currently authorised")
 
-    async def serve(self, conn: TransportConnection, width: int, height: int, fps: int, bitrate: int) -> None:
-        """Wait for STREAM_START, then publish until stop/revoke/disconnect."""
+    async def serve(self, conn: TransportConnection, width: int, height: int, fps: int, bitrate: int,
+                    *, start_msg=None) -> None:
+        """Wait for STREAM_START (unless the coordinator already read it and passes
+        it as start_msg), then publish until stop/revoke/disconnect."""
         self._require_publish()
 
-        # Race the (possibly long) STREAM_START wait against revocation so a
-        # revoke here doesn't let us start capture/encode on stale authority.
-        started = await self._recv_control_or_revoked(conn)
+        if start_msg is None:
+            # Race the (possibly long) STREAM_START wait against revocation so a
+            # revoke here doesn't let us start capture/encode on stale authority.
+            started = await self._recv_control_or_revoked(conn)
+        else:
+            started = start_msg  # coordinator consumed it and granted consent first
         if started is None or started.type is not MessageType.STREAM_START:
             return
         if not self._token.valid:  # re-check after the await, before any side effect

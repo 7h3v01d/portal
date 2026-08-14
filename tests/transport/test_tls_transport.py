@@ -157,7 +157,9 @@ async def test_video_flood_does_not_starve_control():
 
 
 @pytest.mark.asyncio
-async def test_video_is_lossy_latest_wins():
+async def test_video_reports_drops_for_resync():
+    # A4d: dropped encoded frames must be VISIBLE to the consumer (via the drop
+    # count) so it can resync the H.264 chain — not silently discarded.
     host = Ed25519Identity.generate("Dad")
     ctrl = Ed25519Identity.generate("Leon")
     server_conn, client_conn, listener = await _pair(host, ctrl)
@@ -165,8 +167,17 @@ async def test_video_is_lossy_latest_wins():
         for i in range(100):
             await client_conn.send_video(f"f{i}".encode())
         await asyncio.sleep(0.1)
-        frame = await asyncio.wait_for(server_conn.recv_video(), timeout=2.0)
-        assert int(frame.decode()[1:]) >= 90  # a recent frame, not frame 0
+        # The reported drops account for everything the buffer discarded, from
+        # the very first delivered frame onward.
+        total_seen = 0
+        total_dropped = 0
+        while server_conn._video:  # drain what's buffered
+            r = await server_conn.recv_video()
+            total_seen += 1
+            total_dropped += r.dropped
+        # Everything sent is accounted for: delivered + dropped == 100 sent so far.
+        assert total_seen + total_dropped == 100
+        assert total_dropped > 0  # the buffer really did drop frames
     finally:
         await client_conn.close()
         await server_conn.close()

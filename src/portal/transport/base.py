@@ -46,11 +46,23 @@ prior to allocation."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from ..common.constants import (  # noqa: F401  (referenced by the contract)
     MAX_BULK_FRAME_BYTES,
     MAX_CONTROL_MESSAGE_BYTES,
 )
+
+
+@dataclass(frozen=True)
+class VideoReceipt:
+    """A received video frame plus how many frames the transport dropped (drop-
+    oldest) immediately before it. `dropped > 0` means the encoded stream has a
+    gap — H.264 packets are interdependent, so the consumer must resync (reset the
+    decoder and request a keyframe) rather than feed the decoder a broken chain."""
+
+    data: bytes
+    dropped: int
 
 
 class TransportConnection(ABC):
@@ -89,15 +101,20 @@ class TransportConnection(ABC):
     async def send_video(self, data: bytes) -> None:
         """Send one video frame. The video channel is LOSSY by contract: the
         receiver keeps only the most recent frames (drop-oldest) and the reader
-        NEVER blocks on it. This is what stops a slow/absent video consumer from
-        starving the control plane — an emergency stop/revoke must never be stuck
-        behind a backlog of stale video (A4)."""
+        NEVER blocks on it. This prevents *application-queue* starvation — a slow
+        video consumer cannot suspend control-plane demultiplexing at the queue
+        layer (A4a). NOTE: a single TCP stream still permits unavoidable
+        *wire-level* head-of-line delay — video bytes already serialised ahead of
+        a control frame cannot be leapfrogged (tracked under A4c); that is a
+        transport-architecture limit, not something this buffer can solve."""
 
     @abstractmethod
-    async def recv_video(self) -> bytes:
-        """Receive the next available video frame (older frames may have been
-        dropped). MUST reject a declared length > MAX_BULK_FRAME_BYTES before
-        allocating."""
+    async def recv_video(self) -> "VideoReceipt":
+        """Receive the next available video frame as a VideoReceipt (data +
+        dropped count). Because video is drop-oldest, `dropped` reports how many
+        frames were discarded before this one — a non-zero value means the
+        H.264 chain has a gap and the consumer must resync. MUST reject a declared
+        length > MAX_BULK_FRAME_BYTES before allocating."""
 
     @abstractmethod
     async def close(self) -> None:

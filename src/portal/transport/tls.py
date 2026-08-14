@@ -39,7 +39,7 @@ from ..common.errors import TransportError
 from ..common.logging import get_logger
 from ..security.handshake import ROLE_CLIENT, ROLE_SERVER, build_auth, verify_auth
 from ..security.identity import Ed25519Identity
-from .base import TransportConnection, TransportListener, TransportProvider
+from .base import TransportConnection, TransportListener, TransportProvider, VideoReceipt
 from .throttle import ConnectionThrottle
 from .tls_certs import make_ephemeral_cert_files
 
@@ -94,8 +94,12 @@ class TlsConnection(TransportConnection):
         self._control: asyncio.Queue[bytes] = asyncio.Queue(maxsize=CONTROL_QUEUE_MAX)
         self._bulk: asyncio.Queue[bytes] = asyncio.Queue(maxsize=BULK_QUEUE_MAX)
         # Video is LOSSY: a bounded drop-oldest buffer the reader never blocks on,
-        # so a slow/absent video consumer can never starve the control plane (A4).
-        self._video: deque[bytes] = deque(maxlen=VIDEO_QUEUE_MAX)
+        # so a slow/absent video consumer can never starve the control plane (A4a).
+        # Each frame carries a monotonic sequence assigned on receipt, so the
+        # consumer can detect drop-oldest gaps (A4d) and resync the decoder.
+        self._video: deque[tuple[int, bytes]] = deque(maxlen=VIDEO_QUEUE_MAX)
+        self._video_seq = 0
+        self._video_last_delivered: int | None = None
         self._video_available = asyncio.Event()
         self._closed = False
         self._error: Exception | None = None
@@ -120,10 +124,12 @@ class TlsConnection(TransportConnection):
                     except asyncio.QueueFull:
                         raise TransportError("control queue overflow — closing connection")
                 elif tag == _TAG_VIDEO:
-                    # Never block on video: drop-oldest. This is the A4 guarantee —
+                    # Never block on video: drop-oldest. This is the A4a guarantee —
                     # a slow video consumer cannot suspend the reader and thereby
-                    # starve control-plane frames (stop / revoke / emergency kill).
-                    self._video.append(body)
+                    # starve control-plane frames. The sequence number lets the
+                    # consumer detect any dropped frames and resync (A4d).
+                    self._video.append((self._video_seq, body))
+                    self._video_seq += 1
                     self._video_available.set()
                 else:
                     # File bulk is reliable: backpressure the sender at the TCP
@@ -190,14 +196,22 @@ class TlsConnection(TransportConnection):
     async def send_video(self, data: bytes) -> None:
         await self._send(_TAG_VIDEO, data)
 
-    async def recv_video(self) -> bytes:
-        """Return the next available video frame. Older frames may have been
-        dropped (the buffer is drop-oldest); the consumer wants the latest."""
+    async def recv_video(self) -> "VideoReceipt":
+        """Return the next available video frame plus how many frames were dropped
+        (drop-oldest) before it, so the consumer can resync a broken H.264 chain."""
         while True:
             if self._closed:
                 raise TransportError(self._error and str(self._error) or "connection closed")
             if self._video:
-                return self._video.popleft()
+                seq, body = self._video.popleft()
+                # Report any gap since the last delivered frame. For the very
+                # first delivery, the baseline is "before frame 0", so frames the
+                # buffer dropped before we started consuming are still counted —
+                # nothing is silently lost from the accounting.
+                baseline = -1 if self._video_last_delivered is None else self._video_last_delivered
+                dropped = seq - baseline - 1
+                self._video_last_delivered = seq
+                return VideoReceipt(data=body, dropped=dropped)
             self._video_available.clear()
             wait_task = asyncio.ensure_future(self._video_available.wait())
             closed_task = asyncio.ensure_future(self._closed_event.wait())

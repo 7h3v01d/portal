@@ -279,17 +279,76 @@ revert-proven (they fail against the pre-fix code) for both paths. Gate 6 stays
 open until the rest of the 6.1 pass (A1 pre-TLS admission, A3 composed authority
 path, A5 decode ceilings) closes.
 
-**A4 — control-plane starvation: FIXED.** Video moved to a dedicated LOSSY channel
-(`send_video`/`recv_video`): a bounded drop-oldest buffer the reader never blocks
-on, so a slow/absent video consumer can no longer suspend the reader and starve
-control frames (stop / revoke / emergency kill). File bulk stays reliable
-(backpressure). Regression is the reviewer's own reproduction — flood video, then
-an urgent control frame still arrives — and it is revert-proven (times out against
-the old blocking path). Residual, documented: a concurrent *saturating file
-transfer* can still delay control via bulk backpressure; the full fix (per-stream
-/ separate control transport) is tracked for the internet-transport phase, but the
-Phase 7 danger path (screen video + input control, no required concurrent file) is
-now starvation-free.
+**A4 — control-plane starvation: PARTIAL.**
+- *A4a (video app-queue starvation) — FIXED.* Video moved to a dedicated LOSSY
+  channel (`send_video`/`recv_video`): a bounded drop-oldest buffer the reader
+  never blocks on, so a slow/absent video consumer can't suspend the reader.
+  Revert-proven (flood video, urgent control still arrives; times out on the old
+  path).
+- *A4d (encoded-loss recovery) — FIXED.* Dropped video frames are no longer
+  silent: `recv_video()` returns a `VideoReceipt` with a drop count (sequence-gap
+  detected), and the viewer resyncs on any loss — reset the decoder, request a
+  keyframe, discard until the next IDR. Recovery is BOUNDED: if the recovery IDR
+  is itself dropped in the same congestion, the viewer re-requests on a rate-limited
+  timer (RESYNC_RETRY_SECONDS) rather than waiting forever; every drop is counted. Regression uses the
+  REAL encoder+decoder (drop the IDR, prove recovery) and is revert-proven against
+  the silent-drop version.
+- *A4b (reliable file bulk can still block control) — OPEN.* `await bulk.put()`
+  still backpressures the reader, so a saturating file transfer can delay control.
+  The interim fix is session policy: a coordinator must make interactive input and
+  file transfer mutually exclusive on one connection (belongs in A3), or file gets
+  its own connection. Not an assumption in a comment — an enforced invariant.
+- *A4c (TCP head-of-line) — OPEN / architectural.* One TLS/TCP stream serialises
+  all tags, so video bytes already on the wire physically precede a later control
+  frame; a receive-side drop buffer cannot leapfrog them. True fix is separate
+  transports (or QUIC/WebRTC streams) per channel — the internet-transport phase.
+
+**A3 — composed authority path: host path CLOSED (structural gate), controller
+side PARTIAL.** The previous "CLOSED (core)" was premature — the reviewer showed
+the "unknown peers can only pair" guarantee was enforced only incidentally (by a
+re-classify that a refactor could remove) and my headline test passed for the
+wrong reason (it used pair-consent=NO, so pairing never happened). Corrected:
+- Session entry is now a SINGLE unconditional gate, `_may_open_session(conn)` =
+  "is this key pinned in the store?", checked for every path into the session
+  loop. The trust store is the one source of truth; scattered pairing return
+  values can no longer let a peer fall through. Deterministically unit-tested and
+  **revert-proven** (weakening the gate to always-allow fails the tests) — no
+  transport-timing dependence.
+- `_run_pairing` returns an explicit status enum (PAIRED only on a completed
+  commit); pairing has a 60s timeout (M3) so an unknown peer can't park a
+  coordinator forever.
+- Real over-the-transport attack tests added: unknown streams before pairing;
+  unknown knows the code, gets PAIR_ACCEPT, then skips commit and streams; wrong
+  SAS then streams — all blocked, none pinned.
+- M1 fixed (active-operation cleared on revoke / emergency-stop / crash), M2 fixed
+  (the `assert self._authority` is now a real `-O`-safe guard).
+Still open: the controller-side coordinator and the full pairing round-trip
+*driven through* the coordinator remain to be built; this pass hardened and proved
+the host enforcement, which is the security-critical side.
+
+**Process note.** This is the ~fourth time a green test passed because the attack
+wasn't actually attempted. The durable fix applied here: test the security
+INVARIANT at a single deterministic seam and revert-prove it, rather than assert
+on end-to-end side effects whose timing can mask the hole.
+
+**A4b — reliable-bulk control starvation: MITIGATED by enforced mutual exclusion.**
+The coordinator refuses a second operation while one is active (verified: refused
+before consent is even asked), so interactive control and file transfer cannot run
+concurrently on one connection — the exclusion the previous review demanded is now
+enforced policy, not a comment. The deeper transport fix (separate control
+transport / QUIC) remains B6/A4c for the internet phase.
+
+**A6 — TLS 1.3 channel-binding construction: OPEN (cryptographic design review
+required).** Auth still uses `get_channel_binding("tls-unique")`, which RFC 9266
+does not define for TLS 1.3 (tls-exporter is the standardised replacement). Works
+in current CPython/OpenSSL and the relay tests pass, but the construction isn't
+standards-aligned and must not be treated as frozen. (Restored to the ledger — it
+should not have dropped off.)
+
+**Transport wire-version note.** `_TAG_VIDEO=2` is a transport-framing change
+below the JSON envelope version, so `PROTOCOL_VERSION` can't detect a mismatch —
+an old build closes on "unknown channel tag 2". Before mixed family builds run,
+add a transport version / channel-capability handshake.
 
 ### Phase 7 — Remote mouse *(0.4.0 — MVP complete)*
 Control events over the data channel using normalised 0.0–1.0 coordinates.
@@ -338,6 +397,8 @@ so schedule pressure can't quietly downgrade them to "later".
 | B3 | **Private key at rest** — OS-native protection (Windows DPAPI / keyring), not plaintext-with-warning | any "install and forget" / unattended UX | open, Windows-only |
 | B4 | **Concurrency ownership** for `SessionAuthority` / trust store — documented single-owner model or explicit synchronisation before multi-session/threaded use | multi-session work | store lock done in-process; authority ownership to document |
 | B5 | **Input-injection design review** — per-event capability re-check, DPI/multi-monitor coordinate correctness, kill-switch reachable on secure desktop | Phase 7 (before any SendInput) | required precondition |
+| B6 | **Control-plane priority under load** — file bulk backpressure (A4b) + TCP head-of-line (A4c); enforce input/file mutual exclusion or separate transports | Phase 7 (input under load) | open |
+| B7 | **TLS 1.3 channel binding** — move tls-unique -> RFC 9266 tls-exporter (A6) | before freezing the handshake | open |
 
 None of these is a current defect (the Phase 4.1 pass closed the live bugs); they
 are forward risks whose cost rises the later they are addressed. B1, B3, and B5

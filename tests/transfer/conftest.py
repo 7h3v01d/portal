@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 
-from portal.transport.base import TransportConnection
+from portal.transport.base import TransportConnection, VideoReceipt
 
 
 class MemoryConnection(TransportConnection):
@@ -16,7 +16,9 @@ class MemoryConnection(TransportConnection):
         self._peer_key = peer_key
         self._in_control: asyncio.Queue[bytes] = asyncio.Queue()
         self._in_bulk: asyncio.Queue[bytes] = asyncio.Queue()
-        self._in_video: deque[bytes] = deque(maxlen=4)
+        self._in_video: deque[tuple[int, bytes]] = deque(maxlen=4)
+        self._video_seq = 0
+        self._video_last_delivered: int | None = None
         self._video_available = asyncio.Event()
         self._out_control: asyncio.Queue[bytes] | None = None
         self._out_bulk: asyncio.Queue[bytes] | None = None
@@ -49,14 +51,20 @@ class MemoryConnection(TransportConnection):
         return await self._in_bulk.get()
 
     async def send_video(self, data: bytes) -> None:
-        # drop-oldest, never blocks (mirrors the real transport contract)
-        self._out_video._in_video.append(bytes(data))
-        self._out_video._video_available.set()
+        # drop-oldest with sequence numbers, mirroring the real transport
+        peer = self._out_video
+        peer._in_video.append((peer._video_seq, bytes(data)))
+        peer._video_seq += 1
+        peer._video_available.set()
 
-    async def recv_video(self) -> bytes:
+    async def recv_video(self) -> VideoReceipt:
         while True:
             if self._in_video:
-                return self._in_video.popleft()
+                seq, body = self._in_video.popleft()
+                baseline = -1 if self._video_last_delivered is None else self._video_last_delivered
+                dropped = seq - baseline - 1
+                self._video_last_delivered = seq
+                return VideoReceipt(data=body, dropped=dropped)
             self._video_available.clear()
             await self._video_available.wait()
 

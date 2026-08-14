@@ -39,6 +39,7 @@ src/portal/
   encode/      VideoEncoder + pipeline + wire, synthetic + PyAV/libx264 backends
   decode/      PyAV/FFmpeg H.264 decoder
   stream/      screen publisher (host) + viewer (controller)
+  host/        coordinator (composed trust->consent->authority path) + consent
   input/       InputBackend interface      (Windows SendInput later)
   transfer/    TransferBackend interface + LAN engine (verify + atomic rename)
   host/        host agent + session        (later phases)

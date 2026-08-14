@@ -25,19 +25,32 @@ from ..transport.base import TransportConnection
 
 _log = get_logger("stream.viewer")
 
+RESYNC_RETRY_SECONDS = 0.5  # while awaiting resync, re-request a keyframe no more often than this
+
 
 class ScreenViewer:
-    def __init__(self, decoder: PyAvDecoder | None = None, *, max_queue: int = 4) -> None:
+    def __init__(self, decoder: PyAvDecoder | None = None, *, max_queue: int = 4,
+                 clock=None) -> None:
+        import time
+
         self._decoder = decoder or PyAvDecoder()
+        self._clock = clock or time.monotonic
         self._conn: TransportConnection | None = None
         self._running = False
         self._task: asyncio.Task | None = None
         self._queue: deque[DecodedFrame] = deque(maxlen=max_queue)
         self._available = asyncio.Event()
         self._terminal: Exception | None = None
+        self._awaiting_resync = False  # True after a drop, until a keyframe re-syncs
+        self._total_drops = 0
+        self._last_keyframe_request = 0.0
         self.width = 0
         self.height = 0
         self.fps = 0
+
+    @property
+    def total_drops(self) -> int:
+        return self._total_drops
 
     async def start(self, conn: TransportConnection, fps: int = 30, bitrate: int = 6_000_000) -> None:
         self._conn = conn
@@ -93,12 +106,49 @@ class ScreenViewer:
     async def _run(self) -> None:
         try:
             while self._running:
-                raw = await self._conn.recv_video()  # raises on disconnect
-                packet = unpack_packet(raw)
-                for frame in self._decoder.decode(packet.data, packet.is_keyframe, packet.timestamp_ns):
-                    self._enqueue(frame)
+                receipt = await self._conn.recv_video()  # raises on disconnect
+                await self._process_receipt(receipt)
         except Exception as exc:  # noqa: BLE001
             self._terminate(exc)
         finally:
             if self._running:
                 self._terminate(None)
+
+    async def _process_receipt(self, receipt) -> None:
+        """Handle one received video frame: loss detection + bounded resync, then
+        decode. Extracted so the recovery policy is tested against THIS code, not
+        a copy of it."""
+        if receipt.dropped > 0:
+            # Count EVERY drop for truthful telemetry — including drops that occur
+            # while already resyncing.
+            self._total_drops += receipt.dropped
+            if not self._awaiting_resync:
+                # First loss: reset the decoder (drops until the next IDR) and ask
+                # the host for a keyframe.
+                self._awaiting_resync = True
+                self._decoder.reset()
+                await self._send_keyframe_request()
+                _log.info("video loss (%d) — requested resync keyframe", receipt.dropped)
+            elif (self._clock() - self._last_keyframe_request) >= RESYNC_RETRY_SECONDS:
+                # Still awaiting resync and more loss is happening — the recovery
+                # IDR may itself have been dropped in the same congestion.
+                # Re-request, rate-limited so sustained loss can't storm keyframe
+                # requests. This is what makes recovery genuinely BOUNDED.
+                await self._send_keyframe_request()
+                _log.info("still awaiting resync after further loss — re-requested keyframe")
+        packet = unpack_packet(receipt.data)
+        frames = self._decoder.decode(packet.data, packet.is_keyframe, packet.timestamp_ns)
+        if frames and self._awaiting_resync:
+            self._awaiting_resync = False  # a decoded frame after reset => resynced
+        for frame in frames:
+            self._enqueue(frame)
+
+    async def _send_keyframe_request(self) -> None:
+        self._last_keyframe_request = self._clock()
+        if self._conn is not None:
+            try:
+                await self._conn.send_control(
+                    encode(build(MessageType.STREAM_KEYFRAME, EmptyPayload(), sequence=1))
+                )
+            except Exception:  # noqa: BLE001
+                pass
