@@ -60,6 +60,23 @@ DEFAULT_CHUNK_BYTES = 256 * 1024  # 256 KiB per file chunk (rides the bulk chann
 # One chunk plus framing overhead — a length header claiming gigabytes must be
 # refused before any buffer is allocated.
 MAX_BULK_FRAME_BYTES = DEFAULT_CHUNK_BYTES + 4 * 1024
+
+# --- decode resource ceilings (A5) ---
+# A trusted-but-compromised peer must not be able to negotiate or decode into an
+# arbitrarily large frame. Each side may be up to 3840 (so a 4K monitor works in
+# EITHER orientation — 3840x2160 or portrait 2160x3840), but the PIXEL PRODUCT is
+# the real bound: it rejects extreme aspect ratios (e.g. 3840x3840 ≈ 14.7M px)
+# that stay within the per-side limit. This is why the product check is not
+# redundant with the dimension checks.
+MAX_STREAM_WIDTH = 3840
+MAX_STREAM_HEIGHT = 3840
+MAX_STREAM_PIXELS = 3840 * 2160          # ~8.3M px (one 4K frame, either orientation)
+# Upper bound on ONE packed RGB24 payload (8.3M px x 3 = 24,883,200 bytes ≈ 23.7 MiB).
+# This is per-frame, NOT the decoder's total memory: ScreenViewer retains up to
+# VIDEO/queue frames (deque maxlen 4), so the retained Python RGB alone can be
+# ~4x this (~95 MiB at UHD), before native YUV/reference buffers. Bounded, but not
+# a single "decoder memory ceiling".
+MAX_RGB_FRAME_BYTES = MAX_STREAM_PIXELS * 3
 DEFAULT_TRANSFER_SUBDIR = "Remote Transfers"
 PART_SUFFIX = ".part"
 

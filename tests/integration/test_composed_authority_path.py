@@ -152,9 +152,9 @@ async def test_one_operation_at_a_time_mutual_exclusion(tmp_path):
     from portal.host.coordinator import HostCoordinator
     from portal.security.authority import SessionAuthority
 
+    from portal.host.coordinator import SessionContext
     coord = HostCoordinator.__new__(HostCoordinator)
-    coord._authority = SessionAuthority()
-    coord._active_operation = "screen"
+    session = SessionContext(authority=SessionAuthority(), active_operation="screen")
 
     asked = {"n": 0}
 
@@ -173,9 +173,9 @@ async def test_one_operation_at_a_time_mutual_exclusion(tmp_path):
             fps = 30
             bitrate = 1_000_000
 
-    await coord._handle_screen_request(FakeConn(), Msg())
+    await coord._handle_screen_request(FakeConn(), Msg(), session)
     assert asked["n"] == 0, "second operation must be refused before consent"
-    assert coord._active_operation == "screen"
+    assert session.active_operation == "screen"
 
 
 @pytest.mark.asyncio

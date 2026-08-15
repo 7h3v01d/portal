@@ -303,8 +303,22 @@ path, A5 decode ceilings) closes.
   frame; a receive-side drop buffer cannot leapfrog them. True fix is separate
   transports (or QUIC/WebRTC streams) per channel — the internet-transport phase.
 
-**A3 — composed authority path: host path CLOSED (structural gate), controller
-side PARTIAL.** The previous "CLOSED (core)" was premature — the reviewer showed
+**A3 — composed authority path: HOST SIDE CLOSED; controller side PARTIAL.**
+Independently confirmed by reproducing each vulnerability on the prior build and
+defeating it on this one: session-authority isolation (per-session SessionContext,
+no coordinator-global state), pre-consent pairing-code validation (two-stage
+validate_request/confirm_request — a wrong code never prompts the human), and
+awaited connection close on teardown (serve() returns only once authority is gone
+AND the transport is closed). Still open: the controller-side coordinator and the
+full pairing round-trip driven through it.
+
+Note (belongs with Gate 3.1, not A3): pairing still auto-opens on any unknown
+connection, so a remote unknown peer can cause a pairing CODE to be displayed
+(never a SAS prompt — that needs the code). And because PairingManager is created
+per connection, its source/global guess budgets do not persist across reconnects.
+The fix is a single host-owned pairing WINDOW (host enables pairing → one manager,
+one code, persistent budgets → window closes → unknown rejected), tracked under
+Gate 3.1 with A1. The previous "CLOSED (core)" was premature — the reviewer showed
 the "unknown peers can only pair" guarantee was enforced only incidentally (by a
 re-classify that a refactor could remove) and my headline test passed for the
 wrong reason (it used pair-consent=NO, so pairing never happened). Corrected:
@@ -331,12 +345,33 @@ wasn't actually attempted. The durable fix applied here: test the security
 INVARIANT at a single deterministic seam and revert-prove it, rather than assert
 on end-to-end side effects whose timing can mask the hole.
 
-**A4b — reliable-bulk control starvation: MITIGATED by enforced mutual exclusion.**
+**A4b — reliable-bulk control starvation: mutual-exclusion SCAFFOLD in place (per-session, single active operation); full cross-operation enforcement (screen/file/input) awaits the file+input coordinator paths, so not yet provable end-to-end.**
 The coordinator refuses a second operation while one is active (verified: refused
 before consent is even asked), so interactive control and file transfer cannot run
 concurrently on one connection — the exclusion the previous review demanded is now
 enforced policy, not a comment. The deeper transport fix (separate control
 transport / QUIC) remains B6/A4c for the internet phase.
+
+**A5 — decode resource ceilings: CLOSED.** Layered, from lowest to highest:
+1. `StreamParamsPayload` bounds negotiated geometry (each side ≤ 3840, pixel
+   product ≤ 8.3M — both 4K orientations allowed, extreme aspect ratios rejected).
+2. libavcodec `max_pixels` is set on the decoder context, so an oversized/hostile
+   SPS is refused INSIDE the native decoder (at `avcodec_send_packet`) before
+   FFmpeg does the full decode work — not merely after. (Earlier build checked
+   only the returned VideoFrame; that was one layer too late, now fixed.)
+3. Python post-decode check independently bounds the returned geometry (and the
+   packed RGB byte count, `MAX_RGB_FRAME_BYTES`) BEFORE `reformat()` materialises
+   the buffer, and requires it match the expected geometry.
+Legitimate resolution changes (Gate 5) are preserved: a change is accepted when it
+arrives as a KEYFRAME whose honest wire-header geometry passes the ceilings, then
+the expected geometry re-pins — "dynamic resolution allowed, arbitrary resolution
+not". (The previous permanent geometry pin regressed Gate 5; fixed.) The
+security invariant is now exercised in the CORE suite via no-PyAV reformat-spy
+tests proving oversized/mismatched frames raise before `reformat` is ever reached,
+with the real-H.264 tests proving the libavcodec integration. All revert-proven.
+Note: `MAX_RGB_FRAME_BYTES` is a per-frame bound (~23.7 MiB); the viewer's
+drop-oldest deque retains up to ~4× that (~95 MiB at UHD) — bounded, documented,
+not a single total-memory ceiling.
 
 **A6 — TLS 1.3 channel-binding construction: OPEN (cryptographic design review
 required).** Auth still uses `get_channel_binding("tls-unique")`, which RFC 9266

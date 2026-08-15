@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..common.constants import (
     MAX_CAPABILITY_LIST_LEN,
@@ -31,6 +31,9 @@ from ..common.constants import (
     MAX_ERROR_DETAIL_LEN,
     MAX_SEQUENCE,
     MAX_SESSION_ID_LEN,
+    MAX_STREAM_HEIGHT,
+    MAX_STREAM_PIXELS,
+    MAX_STREAM_WIDTH,
 )
 from .capabilities import Capability
 
@@ -214,9 +217,21 @@ class StreamStartPayload(BaseModel):
 
 class StreamParamsPayload(BaseModel):
     model_config = _WIRE
-    width: int = Field(ge=1, le=16384)
-    height: int = Field(ge=1, le=16384)
+    width: int = Field(ge=1, le=MAX_STREAM_WIDTH)
+    height: int = Field(ge=1, le=MAX_STREAM_HEIGHT)
     fps: int = Field(ge=1, le=120)
+
+    @model_validator(mode="after")
+    def _bound_pixels(self) -> "StreamParamsPayload":
+        # Reject an oversized frame by pixel PRODUCT too — width and height each
+        # within range can still multiply past the cap (A5). Checked before any
+        # decode/allocation downstream trusts these numbers.
+        if self.width * self.height > MAX_STREAM_PIXELS:
+            raise ValueError(
+                f"stream geometry {self.width}x{self.height} exceeds "
+                f"{MAX_STREAM_PIXELS} pixel ceiling"
+            )
+        return self
 
 
 class FileOfferPayload(BaseModel):

@@ -56,7 +56,7 @@ class FakeDecoder:
     exercise the re-request policy deterministically."""
 
     def reset(self): ...
-    def decode(self, data, is_keyframe, ts=0):
+    def decode(self, data, is_keyframe, ts=0, declared=None):
         return []
 
 
@@ -91,7 +91,26 @@ async def test_bounded_rerequest_and_truthful_telemetry():
 
 
 @pytest.mark.asyncio
-async def test_no_rerequest_storm_within_interval():
+async def test_clean_frame_after_cooldown_triggers_retry():
+    # The reviewer's exact scenario: loss -> request #1; recovery IDR lost inside
+    # the cooldown (no request); then a CLEAN packet (dropped==0) arrives after
+    # the cooldown expires -> must trigger request #2. Previously the retry only
+    # ran inside `if dropped > 0`, so a clean frame never re-triggered it.
+    clock = FakeClock()
+    conn = ScriptedConn([_pkt(3), _pkt(2), _pkt(0)])  # loss, loss, CLEAN
+    viewer = ScreenViewer(FakeDecoder(), clock=clock)
+    viewer._conn = conn
+    viewer._running = True
+
+    r = await conn.recv_video(); await viewer._process_receipt(r)   # loss -> request #1
+    # Second loss still inside cooldown -> no new request.
+    r = await conn.recv_video(); await viewer._process_receipt(r)
+    assert conn.keyframe_requests == 1
+    # Cooldown expires, then a CLEAN packet arrives.
+    clock.advance(RESYNC_RETRY_SECONDS + 0.01)
+    r = await conn.recv_video(); await viewer._process_receipt(r)   # clean -> request #2
+    assert conn.keyframe_requests == 2, "clean packet after cooldown must re-request"
+    assert viewer.total_drops == 5
     clock = FakeClock()
     conn = ScriptedConn([_pkt(2), _pkt(2)])  # two losses close together
     viewer = ScreenViewer(FakeDecoder(), clock=clock)

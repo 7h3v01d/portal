@@ -27,6 +27,7 @@ Invariants this coordinator enforces (not assumes):
 from __future__ import annotations
 
 from enum import Enum
+from dataclasses import dataclass
 
 from ..common.logging import get_logger, redact
 
@@ -40,6 +41,16 @@ class _PairingStep(Enum):
     REJECTED = "rejected"                   # bad code / SAS declined
     NO_COMMIT = "no_commit"                 # accepted but no PAIR_CONFIRM followed
     COMMIT_FAILED = "commit_failed"         # commit nonce/key mismatch
+
+
+@dataclass
+class SessionContext:
+    """Per-connection session state. Authority and the active-operation flag live
+    HERE, local to one serve() call — never on the shared coordinator — so
+    concurrent sessions cannot revoke or observe each other's authority."""
+
+    authority: SessionAuthority
+    active_operation: str | None = None
 from ..protocol.capabilities import Capability
 from ..protocol.codec import build, decode, encode
 from ..protocol.messages import (
@@ -76,16 +87,23 @@ class HostCoordinator:
         self._capture_factory = capture_factory
         self._encoder_factory = encoder_factory
         self._screen_w, self._screen_h = screen_size
-        self._authority: SessionAuthority | None = None
-        self._active_operation: str | None = None
+        # Live sessions — per-connection SessionContexts, insertion-ordered. No
+        # authority state lives directly on the coordinator; each serve() owns its
+        # own, so concurrent sessions are fully isolated.
+        self._sessions: list[SessionContext] = []
 
     def emergency_stop(self) -> None:
-        """Kill-switch: revoke every capability on the live session at once. Safe
-        to call from a hotkey handler. Phase 7 binds this to Ctrl+Alt+Shift+F12."""
-        if self._authority is not None:
-            self._authority.revoke_all()
-            self._active_operation = None  # let the session accept new operations after
-            _log.info("emergency stop — all capabilities revoked")
+        """Kill-switch: revoke every capability on EVERY live session at once.
+        Safe to schedule from a hotkey via loop.call_soon_threadsafe (see the
+        threading note in the roadmap; do not call cross-thread directly)."""
+        for ctx in list(self._sessions):
+            ctx.authority.revoke_all()
+            ctx.active_operation = None
+        _log.info("emergency stop — all capabilities on %d session(s) revoked", len(self._sessions))
+
+    def _sessions_for_test(self) -> list[SessionContext]:
+        """Test-only accessor for live session contexts (insertion order)."""
+        return list(self._sessions)
 
     async def serve(self, conn: TransportConnection, source: str = "unknown") -> None:
         """Handle one authenticated connection through the full path.
@@ -114,24 +132,35 @@ class HostCoordinator:
             await conn.close()
             return
 
-        self._authority = SessionAuthority()
+        # Per-session state, local to THIS serve() — never on the coordinator.
+        session = SessionContext(authority=SessionAuthority())
+        self._sessions.append(session)
         peer = authenticated_peer(conn)
         _log.info("session established with trusted peer %s", redact(peer.device_id))
         try:
-            await self._session_loop(conn)
+            await self._session_loop(conn, session)
         finally:
-            self._teardown()
+            await self._teardown(session, conn)
 
     def _may_open_session(self, conn: TransportConnection) -> bool:
         """The one gate to a session: the transport-authenticated key must be a
         pinned, trusted device in the store. Deterministically unit-tested."""
         return classify_peer(self._store, conn) is TrustStatus.TRUSTED
 
-    def _teardown(self) -> None:
-        if self._authority is not None:
-            self._authority.revoke_all()  # disconnect kills all authority
-        self._authority = None
-        self._active_operation = None
+    async def _teardown(self, session: SessionContext, conn: TransportConnection) -> None:
+        # This session's authority dies — and ONLY this session's.
+        session.authority.revoke_all()
+        session.active_operation = None
+        if session in self._sessions:
+            self._sessions.remove(session)
+        # Await the close so the invariant holds: when serve() returns, this
+        # session's authority is gone AND its transport is actually closed — not
+        # merely scheduled to close (a fire-and-forget task can be dropped if the
+        # loop stops right after serve() returns). close() is idempotent.
+        try:
+            await conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _run_pairing(self, conn: TransportConnection, source: str) -> "_PairingStep":
         """Drive host-side pairing for an unknown peer. Returns PAIRED only if the
@@ -155,23 +184,24 @@ class HostCoordinator:
 
         peer_key = conn.peer_public_key  # authenticated by the transport
 
-        from ..security.identity import DeviceIdentity
-        from ..security.pairing import PairingConfirmation, compute_sas
-
-        peer_id = DeviceIdentity.from_public_key(peer_key, device_name="")
-        sas = compute_sas(self._identity.identity.public_key, peer_key)
-        confirmation = PairingConfirmation(peer=peer_id, sas=sas, fingerprint=peer_id.fingerprint())
-        approved = await self._consent.confirm_pairing(confirmation)
-
-        result = mgr.handle_request(
+        # STAGE 1: validate the pairing code (and charge the guess budget) BEFORE
+        # any human interaction. A peer that doesn't know the code is rejected
+        # here and NEVER causes a SAS prompt (anti prompt-spam / social eng).
+        challenge = mgr.validate_request(
             peer_public_key=peer_key,
             code=req.payload.code,
             device_name_hint=req.payload.device_name,
-            confirm=lambda _c: approved,
             source=source,
         )
+        if not challenge.ok:
+            _log.info("pairing request rejected before consent: %s", challenge.result.outcome.value)
+            return _PairingStep.REJECTED
+
+        # STAGE 2: code proven — now (and only now) ask the human to compare SAS.
+        approved = await self._consent.confirm_pairing(challenge.confirmation)
+        result = mgr.confirm_request(challenge, approved)
         if result.outcome is not PairingOutcome.PENDING_COMMIT:
-            _log.info("pairing rejected: %s", result.outcome.value)
+            _log.info("pairing declined at SAS: %s", result.outcome.value)
             return _PairingStep.REJECTED
 
         await conn.send_control(encode(build(
@@ -189,7 +219,7 @@ class HostCoordinator:
         committed = mgr.commit(peer_key, confirm.payload.nonce)
         return _PairingStep.PAIRED if committed.ok else _PairingStep.COMMIT_FAILED
 
-    async def _session_loop(self, conn: TransportConnection) -> None:
+    async def _session_loop(self, conn: TransportConnection, session: SessionContext) -> None:
         """Handle operation requests from a trusted peer, one at a time."""
         while True:
             try:
@@ -197,27 +227,26 @@ class HostCoordinator:
             except Exception:  # noqa: BLE001 — disconnect
                 return
             if msg.type is MessageType.STREAM_START:
-                await self._handle_screen_request(conn, msg)
+                await self._handle_screen_request(conn, msg, session)
             elif msg.type is MessageType.STREAM_STOP:
                 continue
             # Other operations (file receive, future input) dispatch here under the
             # same single-operation lock.
 
-    async def _handle_screen_request(self, conn: TransportConnection, start_msg) -> None:
+    async def _handle_screen_request(self, conn: TransportConnection, start_msg,
+                                     session: SessionContext) -> None:
         # Mutual exclusion (A4b): refuse a second operation while one is active.
-        if self._active_operation is not None:
-            _log.info("screen request refused — operation '%s' already active", self._active_operation)
+        if session.active_operation is not None:
+            _log.info("screen request refused — operation '%s' already active", session.active_operation)
             return
         peer = authenticated_peer(conn)
         if not await self._consent.confirm_operation(peer, "screen"):
             _log.info("screen request denied by host consent")
             return  # trusted, but no consent -> no grant, no operation
 
-        if self._authority is None:  # real guard, not an assert (-O strips asserts)
-            return
-        self._authority.grant(Capability.SCREEN_PUBLISH)
-        token = self._authority.authorize(Capability.SCREEN_PUBLISH)
-        self._active_operation = "screen"
+        session.authority.grant(Capability.SCREEN_PUBLISH)
+        token = session.authority.authorize(Capability.SCREEN_PUBLISH)
+        session.active_operation = "screen"
         try:
             capture = self._capture_factory()
             encoder = self._encoder_factory()
@@ -230,6 +259,5 @@ class HostCoordinator:
             # Always clear the active operation AND drop the capability, even if
             # the operation crashed — otherwise a wedged flag would refuse all
             # future operations on this session (M1).
-            if self._authority is not None:
-                self._authority.revoke(Capability.SCREEN_PUBLISH)
-            self._active_operation = None
+            session.authority.revoke(Capability.SCREEN_PUBLISH)
+            session.active_operation = None

@@ -120,7 +120,36 @@ async def test_unknown_pairs_but_never_commits_then_streams_is_blocked(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_unknown_wrong_sas_cannot_operate(tmp_path):
+async def test_wrong_pairing_code_does_not_prompt_human(tmp_path):
+    # A3.8: a peer that sends a WRONG code must be rejected before any SAS prompt.
+    # We count confirm_pairing calls — it must stay zero for a bad code.
+    class CountingConsent(SpyConsent):
+        def __init__(self):
+            super().__init__(pair=True)
+            self.pairing_prompts = 0
+
+        async def confirm_pairing(self, confirmation):
+            self.pairing_prompts += 1
+            return True
+
+    consent = CountingConsent()
+    store, coord, listener, port, serve_task = await _serve(tmp_path, consent)
+    ctrl = await TlsTransport(Ed25519Identity.generate("Atk")).connect(f"127.0.0.1:{port}")
+    try:
+        for _ in range(50):
+            if consent.code:
+                break
+            await asyncio.sleep(0.02)
+        assert consent.code
+        # Send a code that is definitely NOT the issued one.
+        bogus = "ZZZZ-ZZZZ" if consent.code != "ZZZZ-ZZZZ" else "YYYY-YYYY"
+        await ctrl.send_control(encode(build(
+            MessageType.PAIR_REQUEST, PairRequestPayload(code=bogus, device_name="Atk"), sequence=1)))
+        await asyncio.sleep(0.3)
+        assert consent.pairing_prompts == 0, "human was prompted despite a wrong pairing code"
+        assert store.list_trusted() == []
+    finally:
+        serve_task.cancel(); await ctrl.close(); await listener.close()
     # Pairing consent = NO (SAS mismatch). Peer must not be pinned and must not
     # reach an operation even if it sends STREAM_START afterward.
     consent = SpyConsent(pair=False)

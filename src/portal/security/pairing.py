@@ -114,6 +114,27 @@ class PairingResult:
 
 
 @dataclass
+class PairingChallenge:
+    """Result of stage-1 validate_request. `ok` is True only when the code was
+    correct and a SAS challenge is ready; then `.confirmation` holds the SAS to
+    show the human and stage-2 confirm_request applies their decision. When `ok`
+    is False, `.result` carries the failing outcome (bad code, throttled, etc.)
+    and no human prompt should be shown."""
+
+    result: PairingResult
+    confirmation: "PairingConfirmation | None" = None
+    _nonce: str | None = None
+    _peer: DeviceIdentity | None = None
+
+    @property
+    def ok(self) -> bool:
+        return (
+            self.result.outcome is PairingOutcome.PENDING_COMMIT
+            and self.confirmation is not None
+        )
+
+
+@dataclass
 class _PendingPairing:
     code_hash: bytes
     nonce: str
@@ -247,66 +268,91 @@ class PairingManager:
         confirm: Callable[[PairingConfirmation], bool],
         source: str = "local",
     ) -> PairingResult:
-        """Process an incoming pairing request. `peer_public_key` MUST be the key
-        the transport authenticated. `source` (typically the remote IP) scopes the
-        wrong-guess budget: one source can spend only its own small budget, so it
-        cannot burn a legitimate user's code — a global backstop still bounds a
-        distributed attempt. On a confirmed SAS this does NOT trust yet; it records
-        a pending commit and returns PENDING_COMMIT plus the nonce."""
+        """Back-compat one-shot: validate the code, and only if it is correct run
+        the SAS `confirm` callback. Prefer the two-stage validate_request /
+        confirm_request API when consent is async, so the human is never prompted
+        before the pairing secret is proven."""
+        challenge = self.validate_request(peer_public_key, code, device_name_hint, source=source)
+        if not challenge.ok:
+            return challenge.result
+        if challenge.result.outcome is PairingOutcome.ALREADY_TRUSTED:
+            return challenge.result
+        approved = confirm(challenge.confirmation)
+        return self.confirm_request(challenge, approved)
+
+    def validate_request(
+        self,
+        peer_public_key: bytes,
+        code: str,
+        device_name_hint: str,
+        source: str = "local",
+    ) -> "PairingChallenge":
+        """Stage 1: validate the pairing code and charge the guess budget BEFORE
+        any human interaction. A wrong code is rejected here — the host never
+        shows a SAS prompt to a peer that hasn't proven knowledge of the secret.
+        Returns a challenge whose `.confirmation` carries the SAS to show the
+        human, or `.ok is False` with the failing result."""
         now = self._clock()
         pending = self._pending
         if pending is None:
-            return PairingResult(PairingOutcome.NO_ACTIVE_PAIRING)
+            return PairingChallenge(result=PairingResult(PairingOutcome.NO_ACTIVE_PAIRING))
         if pending.expired(now):
             self._pending = None
-            return PairingResult(PairingOutcome.EXPIRED)
+            return PairingChallenge(result=PairingResult(PairingOutcome.EXPIRED))
 
-        # A source that already spent its budget is refused WITHOUT consuming the
-        # code — that is the anti-grief property.
         if pending.source_attempts.get(source, 0) >= pending.per_source_max:
-            return PairingResult(PairingOutcome.SOURCE_THROTTLED)
+            return PairingChallenge(result=PairingResult(PairingOutcome.SOURCE_THROTTLED))
 
         code_ok = hmac.compare_digest(pending.code_hash, _hash_code(code))
         if not code_ok:
             pending.source_attempts[source] = pending.source_attempts.get(source, 0) + 1
             pending.global_attempts += 1
             if pending.global_attempts >= pending.global_max:
-                self._pending = None  # global backstop: burn the code
+                self._pending = None
                 _log.warning("pairing code exhausted (global attempt cap)")
-                return PairingResult(PairingOutcome.EXHAUSTED)
+                return PairingChallenge(result=PairingResult(PairingOutcome.EXHAUSTED))
             if pending.source_attempts[source] >= pending.per_source_max:
                 _log.info("pairing source throttled after failed attempts")
-                return PairingResult(PairingOutcome.SOURCE_THROTTLED)
-            return PairingResult(PairingOutcome.BAD_CODE)
+                return PairingChallenge(result=PairingResult(PairingOutcome.SOURCE_THROTTLED))
+            return PairingChallenge(result=PairingResult(PairingOutcome.BAD_CODE))
 
+        # Code is correct — consume it (single-use) and prepare the SAS challenge.
         nonce = pending.nonce
-        self._pending = None  # single-use: consume regardless of what follows
+        self._pending = None
 
         try:
             safe_name = ensure_display_text(device_name_hint)[:MAX_DEVICE_NAME_LEN]
             peer = DeviceIdentity.from_public_key(peer_public_key, safe_name)
-        except Exception:
+        except Exception:  # noqa: BLE001
             _log.warning("pairing request had invalid peer identity")
-            return PairingResult(PairingOutcome.DENIED_BY_USER)
+            return PairingChallenge(result=PairingResult(PairingOutcome.DENIED_BY_USER))
 
         if self._store.is_trusted(peer):
-            return PairingResult(PairingOutcome.ALREADY_TRUSTED, peer)
+            return PairingChallenge(result=PairingResult(PairingOutcome.ALREADY_TRUSTED, peer))
 
         confirmation = PairingConfirmation(
             peer=peer, sas=compute_sas(self._own_key, peer.public_key), fingerprint=peer.fingerprint()
         )
-        if not confirm(confirmation):
+        return PairingChallenge(
+            result=PairingResult(PairingOutcome.PENDING_COMMIT, peer, nonce=nonce),
+            confirmation=confirmation,
+            _nonce=nonce,
+            _peer=peer,
+        )
+
+    def confirm_request(self, challenge: "PairingChallenge", approved: bool) -> PairingResult:
+        """Stage 2: apply the human SAS decision for a validated challenge. Only
+        reachable once the code was proven correct in validate_request."""
+        if not challenge.ok:
+            return challenge.result
+        peer = challenge._peer
+        if not approved:
             _log.info("pairing declined at SAS ceremony for %s", redact(peer.device_id))
             return PairingResult(PairingOutcome.DENIED_BY_USER, peer)
-
-        # SAS confirmed: hold trust PENDING until the controller confirms. The
-        # commit TTL starts NOW (after the human finished the ceremony), not at
-        # the top of handle_request — otherwise a slow SAS comparison eats the
-        # commit window.
         self._pending_commit = _PendingCommit(
-            peer=peer, nonce=nonce, created_at=self._clock(), ttl=self._ttl
+            peer=peer, nonce=challenge._nonce, created_at=self._clock(), ttl=self._ttl
         )
-        return PairingResult(PairingOutcome.PENDING_COMMIT, peer, nonce=nonce)
+        return PairingResult(PairingOutcome.PENDING_COMMIT, peer, nonce=challenge._nonce)
 
     def commit(self, peer_public_key: bytes, nonce: str) -> PairingResult:
         """Finalise durable trust on receipt of PAIR_CONFIRM. Requires BOTH the

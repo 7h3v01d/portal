@@ -61,6 +61,10 @@ class ScreenViewer:
         if params.type is not MessageType.STREAM_PARAMS:
             raise EncodeError("host did not send stream parameters")
         self.width, self.height, self.fps = params.payload.width, params.payload.height, params.payload.fps
+        # Set the starting expected geometry (already ceiling-checked by
+        # StreamParamsPayload). A later keyframe-bound resolution change carried in
+        # the packet header is allowed by the decoder (Gate 5), not rejected.
+        self._decoder.expect_geometry(self.width, self.height)
         self._running = True
         self._task = asyncio.create_task(self._run())
 
@@ -129,15 +133,18 @@ class ScreenViewer:
                 self._decoder.reset()
                 await self._send_keyframe_request()
                 _log.info("video loss (%d) — requested resync keyframe", receipt.dropped)
-            elif (self._clock() - self._last_keyframe_request) >= RESYNC_RETRY_SECONDS:
-                # Still awaiting resync and more loss is happening — the recovery
-                # IDR may itself have been dropped in the same congestion.
-                # Re-request, rate-limited so sustained loss can't storm keyframe
-                # requests. This is what makes recovery genuinely BOUNDED.
-                await self._send_keyframe_request()
-                _log.info("still awaiting resync after further loss — re-requested keyframe")
+        # Retry check runs on EVERY packet while awaiting resync — not only when
+        # this packet reported a drop. Otherwise a lost recovery-IDR followed by
+        # clean (dropped == 0) packets would never re-trigger the request and the
+        # viewer could wait forever. THIS is what makes recovery actually bounded.
+        if self._awaiting_resync and (self._clock() - self._last_keyframe_request) >= RESYNC_RETRY_SECONDS:
+            await self._send_keyframe_request()
+            _log.info("still awaiting resync — re-requested keyframe (timer)")
         packet = unpack_packet(receipt.data)
-        frames = self._decoder.decode(packet.data, packet.is_keyframe, packet.timestamp_ns)
+        frames = self._decoder.decode(
+            packet.data, packet.is_keyframe, packet.timestamp_ns,
+            declared=(packet.width, packet.height),
+        )
         if frames and self._awaiting_resync:
             self._awaiting_resync = False  # a decoded frame after reset => resynced
         for frame in frames:

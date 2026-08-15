@@ -11,8 +11,7 @@ yourself.
 **Phase 6 — LAN screen viewer (0.3.0).** The full screen-share loop —
 capture → H.264 encode → authenticated TLS → decode → display — works end to end,
 capability-gated with instant revocation, on top of the hardened identity,
-pairing, transport, and transfer foundation. 221 test cases green (172 test
-functions). Gates 1-6 + Gate 3.1 closed; the whole media loop is tested in-tree
+pairing, transport, and transfer foundation. Core security suite green; media suite requires the [capture] extra (PyAV). See ROADMAP for the live A-finding ledger. Gates 1-5 closed; Gate 6 + Gate 3.1 REOPENED under Phase 6.1 hardening (see ROADMAP); the whole media loop is tested in-tree
 (real libx264 encode/decode over real TLS). Real DXcam grab and the Qt render
 surface are validated on the Windows rig; no input injection yet —
 see [`docs/ROADMAP.md`](docs/ROADMAP.md).
