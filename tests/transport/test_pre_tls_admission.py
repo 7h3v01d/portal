@@ -149,13 +149,13 @@ async def test_raw_flood_beyond_concurrency_cap_is_rejected(monkeypatch):
 @pytest.mark.asyncio
 async def test_close_cancels_inflight_handshakes():
     # Listener shutdown must own the full lifecycle: a peer stalled mid-handshake
-    # must have its in-flight task cancelled by close(), not left lingering until
+    # must have its in-flight task CANCELLED by close(), not left lingering until
     # the handshake timeout.
     host = Ed25519Identity.generate("Dad")
     listener = await TlsTransport(host).listen("127.0.0.1:0")
     port = listener.sockname[1]
     r, w = await asyncio.open_connection("127.0.0.1", port)
-    w.write(b"\x16\x03\x01\x00\x50")  # start a TLS record, then stall
+    w.write(b"\x16\x03\x01\x00\x50")  # start a TLS record, then stall (never finish)
     await w.drain()
     # Let the handshake task spin up.
     for _ in range(40):
@@ -164,9 +164,17 @@ async def test_close_cancels_inflight_handshakes():
         await asyncio.sleep(0.02)
     assert listener._inflight, "no in-flight handshake task registered"
     tasks = list(listener._inflight)
+    # It must genuinely be STALLED (not already finished) at the moment we close,
+    # otherwise "done after close" would prove nothing.
+    assert all(not t.done() for t in tasks), "handshake finished on its own — test can't observe cancellation"
 
-    await listener.close()  # must cancel the in-flight task(s)
-    assert all(t.done() for t in tasks), "close() left an in-flight handshake running"
+    await listener.close()
+
+    # Assert the tasks were CANCELLED SPECIFICALLY — not merely done (which a task
+    # that completed or errored on its own would also satisfy).
+    assert all(t.cancelled() for t in tasks), (
+        "close() did not cancel the in-flight handshake (task ended some other way)"
+    )
     try:
         w.close()
     except Exception:
