@@ -91,6 +91,43 @@ class HostCoordinator:
         # authority state lives directly on the coordinator; each serve() owns its
         # own, so concurrent sessions are fully isolated.
         self._sessions: list[SessionContext] = []
+        # Host-owned pairing WINDOW. Pairing does NOT auto-open on an unknown
+        # connection: the host must explicitly open a window (open_pairing()), and
+        # while it is open a SINGLE PairingManager governs all attempts — so the
+        # per-source/global guess budgets persist across reconnects (a per-
+        # connection manager would reset them). When closed, unknown peers are
+        # rejected outright.
+        self._pairing: PairingManager | None = None
+        self._pairing_code: str | None = None
+
+    def open_pairing(self) -> str:
+        """Host explicitly opens a pairing window and returns the one-time code to
+        display. If a prior window's transaction was burned (exhausted/expired),
+        this issues a FRESH transaction rather than returning a dead code."""
+        if self._pairing is None or self._pairing_burned():
+            self._pairing = PairingManager(self._store, self._identity.identity.public_key)
+            self._pairing_code = self._pairing.begin_pairing()
+            _log.info("pairing window opened")
+        return self._pairing_code
+
+    def _pairing_burned(self) -> bool:
+        # The window is open but its transaction is no longer usable — exhausted,
+        # consumed, OR simply expired by TTL. Use the manager's public state
+        # (which evaluates expiry lazily) rather than poking a private field, and
+        # do NOT treat an in-flight pending commit as burned.
+        mgr = self._pairing
+        if mgr is None:
+            return False
+        return not mgr.pairing_active and not mgr.awaiting_commit
+
+    def close_pairing(self) -> None:
+        self._pairing = None
+        self._pairing_code = None
+        _log.info("pairing window closed")
+
+    @property
+    def pairing_open(self) -> bool:
+        return self._pairing is not None
 
     def emergency_stop(self) -> None:
         """Kill-switch: revoke every capability on EVERY live session at once.
@@ -116,9 +153,21 @@ class HostCoordinator:
         status = classify_peer(self._store, conn)
 
         if status is TrustStatus.UNKNOWN:
+            if self._pairing is None:
+                # Pairing is not open — an unknown peer is refused outright. Pairing
+                # is something the HOST opens deliberately, never something a remote
+                # connection triggers.
+                _log.info("unknown peer refused — no pairing window open")
+                await conn.close()
+                return
             outcome = await self._run_pairing(conn, source)
             if outcome is not _PairingStep.PAIRED:
                 _log.info("pairing did not complete (%s) — closing", outcome.value)
+                # If the transaction was burned (exhausted/expired), close the
+                # window so it doesn't linger "open" with a dead code — the host
+                # must deliberately re-open to get a fresh transaction.
+                if self._pairing_burned():
+                    self.close_pairing()
                 await conn.close()
                 return
 
@@ -163,15 +212,20 @@ class HostCoordinator:
             pass
 
     async def _run_pairing(self, conn: TransportConnection, source: str) -> "_PairingStep":
-        """Drive host-side pairing for an unknown peer. Returns PAIRED only if the
-        peer's key was actually pinned via a completed commit; every other path
-        returns a non-PAIRED status and the caller closes. An unknown peer can
-        reach ONLY this method — never an operation."""
+        """Drive host-side pairing for an unknown peer against the host-owned
+        pairing window. Returns PAIRED only if the peer's key was actually pinned
+        via a completed commit; every other path returns a non-PAIRED status and
+        the caller closes. Uses the SINGLE window manager so per-source/global
+        guess budgets persist across reconnect attempts."""
         import asyncio
 
-        mgr = PairingManager(self._store, self._identity.identity.public_key)
-        code = mgr.begin_pairing()
-        await self._consent.notify_pairing_code(code)  # host UI displays it
+        mgr = self._pairing
+        if mgr is None:
+            return _PairingStep.NO_REQUEST  # window closed between check and here
+        # The code was issued when the window opened; surface it for display (the
+        # host may already be showing it). Do NOT begin a new pairing per
+        # connection — that would reset the guess budgets.
+        await self._consent.notify_pairing_code(self._pairing_code)
 
         try:
             req = decode(await asyncio.wait_for(conn.recv_control(), timeout=PAIRING_TIMEOUT_SECONDS))
@@ -217,7 +271,12 @@ class HostCoordinator:
             # Sent something other than the commit (e.g. STREAM_START) — NOT paired.
             return _PairingStep.NO_COMMIT
         committed = mgr.commit(peer_key, confirm.payload.nonce)
-        return _PairingStep.PAIRED if committed.ok else _PairingStep.COMMIT_FAILED
+        if committed.ok:
+            # A device paired successfully — close the window so it isn't left open
+            # for further unknown peers. The host re-opens it deliberately next time.
+            self.close_pairing()
+            return _PairingStep.PAIRED
+        return _PairingStep.COMMIT_FAILED
 
     async def _session_loop(self, conn: TransportConnection, session: SessionContext) -> None:
         """Handle operation requests from a trusted peer, one at a time."""

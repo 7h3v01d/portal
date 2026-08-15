@@ -24,7 +24,7 @@ async def test_file_transfer_over_tls(tmp_path):
     ctrl = Ed25519Identity.generate("Leon")
 
     listener = await TlsTransport(host).listen("127.0.0.1:0")
-    port = listener._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    port = listener.sockname[1]  # noqa: SLF001
 
     data = bytes(range(256)) * 4096  # 1 MiB, all byte values
     src = tmp_path / "src.bin"

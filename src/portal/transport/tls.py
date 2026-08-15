@@ -278,10 +278,18 @@ async def _authenticate(
 
 
 class TlsListener(TransportListener):
-    def __init__(self, server: asyncio.AbstractServer, identity: Ed25519Identity, queue: asyncio.Queue) -> None:
-        self._server = server
+    def __init__(self, lsock, accept_task, inflight, identity: Ed25519Identity, queue: asyncio.Queue) -> None:
+        self._lsock = lsock
+        self._accept_task = accept_task
+        self._inflight = inflight
         self._identity = identity
         self._queue = queue
+        self._closed = False
+
+    @property
+    def sockname(self):
+        """The bound (host, port) — tests read the ephemeral port from here."""
+        return self._lsock.getsockname()
 
     async def accept(self) -> TransportConnection:
         conn = await self._queue.get()
@@ -290,9 +298,39 @@ class TlsListener(TransportListener):
         return conn
 
     async def close(self) -> None:
-        self._server.close()
+        # Own the full lifecycle: after close() returns, this listener holds no
+        # live connection — the accept loop is stopped, in-flight handshakes are
+        # cancelled, queued-but-unaccepted connections are closed, and the
+        # listening socket is shut.
+        self._closed = True
+        self._accept_task.cancel()
         try:
-            await self._server.wait_closed()
+            await self._accept_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        # Cancel in-flight handshake tasks (a stalled TLS peer would otherwise
+        # linger until its handshake timeout).
+        for t in list(self._inflight):
+            t.cancel()
+        for t in list(self._inflight):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # Close any authenticated connections that reached the queue but were
+        # never accept()ed by the application.
+        while not self._queue.empty():
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(item, Exception):
+                try:
+                    await item.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            self._lsock.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -309,13 +347,17 @@ class TlsTransport(TransportProvider):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE  # identity is authenticated above TLS, not here
         try:
-            reader, writer = await asyncio.open_connection(host, port, ssl=ctx)
-        except OSError as exc:
+            reader, writer = await asyncio.open_connection(
+                host, port, ssl=ctx, ssl_handshake_timeout=HANDSHAKE_TIMEOUT_SECONDS
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
             raise TransportError(f"connect failed: {exc}") from exc
         peer_key = await _authenticate(reader, writer, self._identity, ROLE_CLIENT, ROLE_SERVER)
         return TlsConnection(reader, writer, peer_key)
 
     async def listen(self, endpoint: str) -> TransportListener:
+        import socket
+
         host, port = _parse_endpoint(endpoint)
         cert_path, key_path = make_ephemeral_cert_files()
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -329,21 +371,33 @@ class TlsTransport(TransportProvider):
             per_source_concurrent=CONN_CONCURRENT_PER_SOURCE,
             global_in_flight=CONN_INFLIGHT_GLOBAL_MAX,
         )
+        loop = asyncio.get_event_loop()
+        inflight: set[asyncio.Task] = set()
 
-        async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-            peername = writer.get_extra_info("peername")
-            source = peername[0] if peername else "unknown"
-            # Admission throttling: drop a flooding source before spending a
-            # handshake on it. The slot is held only for the handshake window.
-            admission = throttle.admit(source)
-            if admission is None:
-                _log.info("connection from %s throttled", source)
-                try:
-                    writer.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                return
+        # Manage the listening socket ourselves so we can admit a RAW accepted
+        # socket BEFORE any TLS work, then hand only admitted sockets to asyncio
+        # with SSL via connect_accepted_socket. This avoids a STARTTLS-style
+        # upgrade entirely (no start_tls / manual StreamWriter reconstruction,
+        # which tangled stream ownership and dropped connections), and is the
+        # implementation that behaves predictably on the Python 3.11 target.
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        lsock.bind((host or "0.0.0.0", port))
+        lsock.listen(ACCEPT_QUEUE_MAX)
+        lsock.setblocking(False)
+
+        async def handle(raw_sock, source, admission) -> None:
             try:
+                reader = asyncio.StreamReader(loop=loop)
+                protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
+                # connect_accepted_socket performs the TLS handshake on the already
+                # accepted socket, bounded by ssl_handshake_timeout, and yields a
+                # clean transport/protocol pair we wrap into stream reader/writer.
+                transport, _ = await loop.connect_accepted_socket(
+                    lambda: protocol, raw_sock, ssl=ctx,
+                    ssl_handshake_timeout=HANDSHAKE_TIMEOUT_SECONDS,
+                )
+                writer = asyncio.StreamWriter(transport, protocol, reader, loop)
                 peer_key = await asyncio.wait_for(
                     _authenticate(reader, writer, self._identity, ROLE_SERVER, ROLE_CLIENT),
                     timeout=HANDSHAKE_TIMEOUT_SECONDS,
@@ -352,18 +406,48 @@ class TlsTransport(TransportProvider):
                     queue.put_nowait(TlsConnection(reader, writer, peer_key))
                 except asyncio.QueueFull:
                     _log.warning("accept queue full — dropping inbound connection")
-                    writer.close()
-            except Exception:  # noqa: BLE001 — a failed/slow handshake drops the socket
-                _log.info("inbound connection failed authentication")
+                    _hard_close(writer)
+            except Exception:  # noqa: BLE001 — failed/slow TLS or auth drops the socket
+                _log.info("inbound connection failed TLS/authentication")
                 try:
-                    writer.close()
+                    raw_sock.close()
                 except Exception:  # noqa: BLE001
                     pass
             finally:
-                admission.release()  # free the in-flight slot once handshaking ends
+                admission.release()
 
-        server = await asyncio.start_server(on_client, host, port, ssl=ctx)
-        return TlsListener(server, self._identity, queue)
+        async def accept_loop() -> None:
+            while True:
+                try:
+                    raw_sock, addr = await loop.sock_accept(lsock)
+                except (asyncio.CancelledError, OSError):
+                    return
+                source = addr[0] if addr else "unknown"
+                raw_sock.setblocking(False)
+                # ADMIT BEFORE TLS. A raw / no-ClientHello flooder is counted and
+                # dropped here, never occupying a TLS handshake slot.
+                admission = throttle.admit(source)
+                if admission is None:
+                    _log.info("connection from %s throttled (pre-TLS)", source)
+                    try:
+                        raw_sock.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+                t = asyncio.create_task(handle(raw_sock, source, admission))
+                inflight.add(t)
+                t.add_done_callback(inflight.discard)
+
+        accept_task = asyncio.create_task(accept_loop())
+        return TlsListener(lsock, accept_task, inflight, self._identity, queue)
+
+
+def _hard_close(writer) -> None:
+    """Close a writer/transport, ignoring errors. Safe to call more than once."""
+    try:
+        writer.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _parse_endpoint(endpoint: str) -> tuple[str, int]:

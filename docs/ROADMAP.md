@@ -279,6 +279,42 @@ revert-proven (they fail against the pre-fix code) for both paths. Gate 6 stays
 open until the rest of the 6.1 pass (A1 pre-TLS admission, A3 composed authority
 path, A5 decode ceilings) closes.
 
+**A1 — pre-TLS admission: CLOSED (Gate 3.1 re-closed).** The listener manages its
+own listening socket: it accepts the RAW socket with `loop.sock_accept`, runs
+`throttle.admit(source)` FIRST, and hands only admitted sockets to asyncio with SSL
+via `loop.connect_accepted_socket(..., ssl=ctx, ssl_handshake_timeout=...)`. So a
+raw / no-ClientHello flooder is counted and dropped by the per-source/global limits
+before any TLS work. (A first attempt used `loop.start_tls` + manual StreamWriter
+reconstruction; that tangled stream ownership and dropped ordinary traffic after a
+successful handshake in a TIMING-DEPENDENT way — it passed locally but failed under
+different scheduling. `connect_accepted_socket` avoids the STARTTLS conversion
+entirely and is stable across repeated runs.) Client `connect()` now also passes
+`ssl_handshake_timeout` for symmetry. Proven: silent peer → admit runs in <1s
+(revert-proven vs the old ~60s stall); a deterministic cap test shows 5 stalled raw
+sockets from one source → exactly 2 admitted / 3 denied (revert-proven that the cap
+patch is load-bearing).
+
+Pairing-window hardening (Gate 3.1 companion): pairing no longer auto-opens on an
+unknown connection — the host opens a window deliberately (`open_pairing()`), and a
+SINGLE host-owned `PairingManager` governs the window so guess budgets persist
+across reconnects. With no window open, unknown peers are refused outright. A burned
+transaction (exhausted/expired) is detected so `open_pairing()` re-issues a FRESH
+transaction instead of a dead code, and the window closes on terminal outcomes.
+Tests: closed-window refusal, budget persistence, burned-window reopen, and a
+correct-code→SAS-denied test (this last replaced a false green — dangling code that
+used a WRONG code so it never reached the SAS ceremony it claimed to test). All
+revert-proven.
+
+Post-sign-off lifecycle fixes: (a) `_pairing_burned()` now uses the manager's
+public `pairing_active`/`awaiting_commit` (which evaluate TTL lazily) instead of a
+private `_pending` peek, so an IDLE-EXPIRED window is correctly detected and
+re-opened with a fresh code rather than handing out a dead one (clock-injected
+regression, revert-proven). (b) `TlsListener.close()` now owns the full lifecycle:
+it stops the accept loop, CANCELS in-flight handshake tasks (a stalled peer no
+longer lingers to its handshake timeout), closes any authenticated-but-unaccepted
+queued connections, and shuts the listening socket — so after close() the listener
+holds no live connection (revert-proven).
+
 **A4 — control-plane starvation: PARTIAL.**
 - *A4a (video app-queue starvation) — FIXED.* Video moved to a dedicated LOSSY
   channel (`send_video`/`recv_video`): a bounded drop-oldest buffer the reader
@@ -352,26 +388,31 @@ concurrently on one connection — the exclusion the previous review demanded is
 enforced policy, not a comment. The deeper transport fix (separate control
 transport / QUIC) remains B6/A4c for the internet phase.
 
-**A5 — decode resource ceilings: CLOSED.** Layered, from lowest to highest:
-1. `StreamParamsPayload` bounds negotiated geometry (each side ≤ 3840, pixel
-   product ≤ 8.3M — both 4K orientations allowed, extreme aspect ratios rejected).
-2. libavcodec `max_pixels` is set on the decoder context, so an oversized/hostile
-   SPS is refused INSIDE the native decoder (at `avcodec_send_packet`) before
-   FFmpeg does the full decode work — not merely after. (Earlier build checked
-   only the returned VideoFrame; that was one layer too late, now fixed.)
-3. Python post-decode check independently bounds the returned geometry (and the
-   packed RGB byte count, `MAX_RGB_FRAME_BYTES`) BEFORE `reformat()` materialises
-   the buffer, and requires it match the expected geometry.
-Legitimate resolution changes (Gate 5) are preserved: a change is accepted when it
-arrives as a KEYFRAME whose honest wire-header geometry passes the ceilings, then
-the expected geometry re-pins — "dynamic resolution allowed, arbitrary resolution
-not". (The previous permanent geometry pin regressed Gate 5; fixed.) The
-security invariant is now exercised in the CORE suite via no-PyAV reformat-spy
-tests proving oversized/mismatched frames raise before `reformat` is ever reached,
-with the real-H.264 tests proving the libavcodec integration. All revert-proven.
-Note: `MAX_RGB_FRAME_BYTES` is a per-frame bound (~23.7 MiB); the viewer's
-drop-oldest deque retains up to ~4× that (~95 MiB at UHD) — bounded, documented,
-not a single total-memory ceiling.
+**A5 — decode resource ceilings: CLOSED.** Layered, lowest to highest:
+1. `StreamParamsPayload` bounds negotiated geometry (each side ≤ 3840, product ≤
+   8.3M — both 4K orientations allowed, extreme ratios rejected).
+2. libavcodec `max_pixels` is installed on the decoder context via the AVOption
+   route and **fails closed**: the decoder opens the codec, and if `max_pixels`
+   was not consumed by `avcodec_open2` (still present on `ctx.options`) or the
+   open fails, it raises rather than decoding with no native guard. So a hostile
+   oversized SPS is refused inside FFmpeg at `avcodec_send_packet`, before the
+   full native decode/allocation.
+3. Python post-decode checks independently bound the returned geometry AND the RGB
+   byte count BEFORE `reformat()` materialises the buffer, and require the frame
+   match the expected geometry.
+Legitimate resolution changes (Gate 5) are preserved via keyframe-bound, honest-
+header, in-ceiling transitions; the viewer's advertised width/height now follows a
+validated resize (Gate-7 input-mapping readiness).
+
+Tests are genuinely layer-isolating (this took two iterations — the first native
+test was a false green because the Python precheck rejected the declared geometry
+before FFmpeg ran): `test_native_max_pixels_is_installed` proves the AVOption was
+consumed; `test_native_ceiling_rejects_lying_oversized_bitstream` lies in the wire
+header so the oversized bitstream reaches FFmpeg and asserts the NATIVE "decode
+failed" rejection (revert-proven: removing max_pixels makes it fall through to the
+Python ceiling — a different message — and the test fails). No-PyAV reformat-spy
+tests keep the Python invariant in the core suite; fail-closed and viewer-resize
+have their own regressions. All revert-proven.
 
 **A6 — TLS 1.3 channel-binding construction: OPEN (cryptographic design review
 required).** Auth still uses `get_channel_binding("tls-unique")`, which RFC 9266

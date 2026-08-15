@@ -30,7 +30,7 @@ async def _tls_pair():
     host_id = Ed25519Identity.generate("Dad")
     ctrl_id = Ed25519Identity.generate("Leon")
     listener = await TlsTransport(host_id).listen("127.0.0.1:0")
-    port = listener._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    port = listener.sockname[1]  # noqa: SLF001
     accept = asyncio.create_task(listener.accept())
     ctrl_conn = await TlsTransport(ctrl_id).connect(f"127.0.0.1:{port}")
     host_conn = await accept

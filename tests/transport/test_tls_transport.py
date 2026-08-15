@@ -18,7 +18,7 @@ async def _pair(host_identity, ctrl_identity):
     """Stand up a listener and a connection over loopback; return (server_conn,
     client_conn, listener)."""
     listener = await TlsTransport(host_identity).listen("127.0.0.1:0")
-    port = listener._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    port = listener.sockname[1]  # noqa: SLF001
     accept_task = asyncio.create_task(listener.accept())
     client_conn = await TlsTransport(ctrl_identity).connect(f"127.0.0.1:{port}")
     server_conn = await accept_task
@@ -196,7 +196,7 @@ async def test_listener_throttles_connection_flood(monkeypatch):
     host = Ed25519Identity.generate("Dad")
     ctrl = Ed25519Identity.generate("Leon")
     listener = await TlsTransport(host).listen("127.0.0.1:0")
-    port = listener._server.sockets[0].getsockname()[1]  # noqa: SLF001
+    port = listener.sockname[1]  # noqa: SLF001
     try:
         succeeded, failed = 0, 0
         for _ in range(10):

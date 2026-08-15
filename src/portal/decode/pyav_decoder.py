@@ -47,19 +47,27 @@ class PyAvDecoder:
                 import av  # type: ignore
             except Exception as exc:  # noqa: BLE001
                 raise EncodeError("PyAV is required to decode video") from exc
-            self._av = av
             ctx = av.CodecContext.create("h264", "r")
             # A5 lowest layer: bound the frame size INSIDE libavcodec, before any
-            # native decode work, via AVCodecContext.max_pixels (FFmpeg's documented
-            # OOM/slow-decode guard). A hostile SPS claiming a gigantic geometry is
-            # refused by the native decoder itself, not merely after it returns.
+            # native decode work, via the max_pixels AVOption (FFmpeg's documented
+            # OOM/slow-decode guard). This MUST fail CLOSED — the whole point of the
+            # gate is to stop decoder-level allocation attacks, so if we cannot
+            # install it, we refuse to decode rather than hope the post-decode
+            # check catches an attack after the native allocation already happened.
+            options = dict(getattr(ctx, "options", None) or {})
+            options["max_pixels"] = str(MAX_STREAM_PIXELS)
+            ctx.options = options
             try:
-                ctx.max_pixels = MAX_STREAM_PIXELS
-            except Exception:  # noqa: BLE001 — older PyAV may expose it via options
-                try:
-                    ctx.options = {"max_pixels": str(MAX_STREAM_PIXELS)}
-                except Exception:  # noqa: BLE001
-                    _log.warning("PyAV lacks max_pixels; relying on post-decode ceiling only")
+                ctx.open()
+            except Exception as exc:  # noqa: BLE001
+                raise EncodeError("cannot establish native decoder pixel ceiling") from exc
+            # FFmpeg stores UNCONSUMED options back on the context; if max_pixels
+            # is still present, avcodec_open2 didn't accept it — refuse the decoder.
+            if "max_pixels" in (getattr(ctx, "options", None) or {}):
+                raise EncodeError("FFmpeg did not accept max_pixels; refusing to decode")
+            # Assign state only AFTER the full security setup succeeds, so a failed
+            # open() never leaves the decoder half-initialised.
+            self._av = av
             self._ctx = ctx
         return self._av
 
@@ -114,12 +122,14 @@ class PyAvDecoder:
                 raise EncodeError(
                     f"decoded geometry {width}x{height} != expected {self._expected}"
                 )
+            # Bound the RGB payload BEFORE reformat() materialises it, so code and
+            # invariant say the same thing (this is implied by the pixel ceiling
+            # above, but stated explicitly on the geometry that drives the alloc).
+            if width * height * 3 > MAX_RGB_FRAME_BYTES:
+                raise EncodeError(f"RGB frame {width}x{height} exceeds byte ceiling")
             rgb = frame.reformat(format="rgb24")
             plane = rgb.planes[0]
             width, height = rgb.width, rgb.height
-            # Belt-and-braces on the materialised RGB payload itself.
-            if width * height * 3 > MAX_RGB_FRAME_BYTES:
-                raise EncodeError(f"RGB frame {width}x{height} exceeds byte ceiling")
             # Copy out tightly packed rows (plane may be padded to a stride).
             import builtins
 

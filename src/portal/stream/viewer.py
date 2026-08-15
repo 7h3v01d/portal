@@ -148,6 +148,11 @@ class ScreenViewer:
         if frames and self._awaiting_resync:
             self._awaiting_resync = False  # a decoded frame after reset => resynced
         for frame in frames:
+            # Keep the viewer's advertised geometry current after a validated live
+            # resize — Phase 7 input mapping must never map against a stale
+            # resolution (host is now frame.width x frame.height).
+            if (frame.width, frame.height) != (self.width, self.height):
+                self.width, self.height = frame.width, frame.height
             self._enqueue(frame)
 
     async def _send_keyframe_request(self) -> None:

@@ -65,7 +65,7 @@ def _coordinator(store, ident, consent):
 
 async def _connect(host_ident, host_store, consent, ctrl_ident):
     listener = await TlsTransport(host_ident).listen("127.0.0.1:0")
-    port = listener._server.sockets[0].getsockname()[1]
+    port = listener.sockname[1]
     coord = _coordinator(host_store, host_ident, consent)
 
     async def accept_and_serve():
