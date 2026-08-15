@@ -141,9 +141,73 @@ async def check_listener_shutdown() -> tuple[bool, str]:
     return True, "in-flight handshake cancelled by close()"
 
 
+async def check_admission_denies_over_cap() -> tuple[bool, str]:
+    """A source that exceeds the per-source concurrency cap is DENIED at admission
+    (pre-TLS) and its socket closed — proving the throttle doesn't just RUN but
+    DECIDES, wired through the live listener. Black-box: no monkeypatching.
+
+    Fill the cap with silent sockets (each stalls in the handshake, holding its
+    in-flight slot), then one more; the extra must be closed promptly (EOF), while
+    an admitted one stays open (read times out)."""
+    from portal.common.constants import CONN_CONCURRENT_PER_SOURCE
+    from portal.security.identity import Ed25519Identity
+    from portal.transport.tls import TlsTransport
+
+    cap = CONN_CONCURRENT_PER_SOURCE
+    host = Ed25519Identity.generate("SmokeHost")
+    listener = await TlsTransport(host).listen("127.0.0.1:0")
+    port = listener.sockname[1]
+    held: list = []
+    try:
+        # Fill the concurrency cap with silent, stalled connections.
+        first_reader = None
+        for i in range(cap):
+            r, w = await asyncio.open_connection("127.0.0.1", port)
+            w.write(b"\x16\x03\x01\x00\x50")  # partial TLS record, then silence
+            await w.drain()
+            held.append(w)
+            if i == 0:
+                first_reader = r
+        # Small settle so all `cap` are admitted and in-flight before the next one.
+        await asyncio.sleep(0.3)
+
+        # One more from the same source — must be DENIED and closed promptly.
+        over_r, over_w = await asyncio.open_connection("127.0.0.1", port)
+        over_w.write(b"\x16\x03\x01\x00\x50")
+        await over_w.drain()
+        try:
+            data = await asyncio.wait_for(over_r.read(1), timeout=5.0)
+        except asyncio.TimeoutError:
+            over_w.close()
+            return False, f"over-cap connection ({cap + 1}) was NOT denied — held open"
+        over_w.close()
+        if data != b"":
+            return False, f"over-cap connection returned data {data!r}, expected EOF"
+
+        # Sanity: an admitted (under-cap) connection is NOT closed — read times out.
+        held_open = False
+        if first_reader is not None:
+            try:
+                await asyncio.wait_for(first_reader.read(1), timeout=1.0)
+            except asyncio.TimeoutError:
+                held_open = True  # good: still stalled in handshake, not closed
+        if not held_open:
+            return False, "an admitted under-cap connection was unexpectedly closed"
+
+        return True, f"connection {cap + 1} denied at cap={cap}; under-cap held open"
+    finally:
+        for w in held:
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
+        await listener.close()
+
+
 CHECKS = {
     "roundtrip": ("control/bulk/video roundtrip + channel-bound auth", check_roundtrip),
     "admission": ("admit() runs before TLS for silent peer", check_pre_tls_admission),
+    "denial": ("over-cap source is denied pre-TLS", check_admission_denies_over_cap),
     "shutdown": ("close() cancels in-flight handshake", check_listener_shutdown),
 }
 
