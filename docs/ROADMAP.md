@@ -495,3 +495,21 @@ pytest + pytest-asyncio. High test density on `protocol/`, `security/`,
 every bug gets a failing test first. Run on the real Windows 11 / Python 3.11.5
 rig; the native smoke test (`scripts/smoke_native.py`) runs before each new phase
 that adds a native dependency.
+
+
+## On-rig validation (LAN MVP release candidate)
+
+A1–A5 are closed and revert-proven in CI (Linux). Before trusting the LAN MVP on
+the target hardware, run BOTH smoke tests on the Windows 10/11 + Python 3.11.x rig:
+
+    python scripts/smoke_native.py --capture   # dependency/stack check (imports)
+    python scripts/smoke_transport.py          # LIVE socket/TLS/admission check
+
+smoke_transport.py opens real loopback sockets and drives the actual TlsTransport
+end to end — control/bulk/video roundtrip, channel-bound auth, pre-TLS admission
+timing, and listener-shutdown cancellation. Each check runs in its OWN SUBPROCESS
+with its own timeout, so results are deterministic and a harness artifact in one
+check cannot masquerade as a transport failure in another. This is the definitive
+check that loop.connect_accepted_socket behaves on Windows (it differs across
+OSes); a green run on the rig is what CI-on-Linux cannot prove. Exit code 0 = all
+checks passed, non-zero = a check failed (usable in rig automation).
