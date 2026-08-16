@@ -240,6 +240,41 @@ def _drain(queue: "asyncio.Queue") -> None:
         pass
 
 
+def _select_channel_binding(ssl_obj) -> tuple[str, bytes]:
+    """Choose the strongest available channel binding for THIS connection.
+
+    RFC 9266 defines `tls-exporter` as the channel binding for TLS 1.3 and
+    deprecates `tls-unique` there. We PREFER tls-exporter whenever the runtime can
+    produce it (CPython 3.13+ exposes it via get_channel_binding); otherwise we
+    fall back to tls-unique, which CPython still computes for TLS 1.3 as the
+    Finished MAC — functional and unique per connection, but not standardised, so
+    we log a warning. Binding the chosen TYPE into the signed transcript (see
+    handshake.py) keeps the construction explicit and upgradeable rather than
+    silently frozen: the day the rig moves to a runtime with tls-exporter, both
+    peers negotiate to it with no wire change beyond the already-present type."""
+    available = getattr(ssl, "CHANNEL_BINDING_TYPES", ("tls-unique",))
+    if "tls-exporter" in available:
+        value = ssl_obj.get_channel_binding("tls-exporter")
+        if value:
+            return "tls-exporter", value
+    # Fallback.
+    value = ssl_obj.get_channel_binding("tls-unique")
+    if not value:
+        raise TransportError("TLS channel binding unavailable")
+    version = None
+    try:
+        version = ssl_obj.version()
+    except Exception:  # noqa: BLE001
+        pass
+    if version == "TLSv1.3":
+        _log.warning(
+            "using non-standard tls-unique channel binding on TLS 1.3 "
+            "(runtime lacks tls-exporter; RFC 9266 prefers tls-exporter) — "
+            "functional but upgrade the runtime to freeze on the standard binding"
+        )
+    return "tls-unique", value
+
+
 async def _authenticate(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -252,13 +287,11 @@ async def _authenticate(
     ssl_obj = writer.get_extra_info("ssl_object")
     if ssl_obj is None:
         raise TransportError("no TLS layer on connection")
-    channel_binding = ssl_obj.get_channel_binding("tls-unique")
-    if not channel_binding:
-        raise TransportError("TLS channel binding unavailable")
+    binding_type, channel_binding = _select_channel_binding(ssl_obj)
 
     import json
 
-    msg = build_auth(identity, own_role, channel_binding)
+    msg = build_auth(identity, own_role, binding_type, channel_binding)
     raw = json.dumps(msg).encode("utf-8")
     writer.write(_encode_frame(_TAG_CONTROL, raw))
     await writer.drain()
@@ -271,7 +304,7 @@ async def _authenticate(
         raise TransportError("unexpected auth frame")
     try:
         peer_msg = json.loads(body)
-        peer = verify_auth(peer_msg, peer_role, channel_binding)
+        peer = verify_auth(peer_msg, peer_role, binding_type, channel_binding)
     except Exception as exc:  # noqa: BLE001
         raise TransportError("peer authentication failed") from exc
     return peer.public_key
