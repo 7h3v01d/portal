@@ -414,22 +414,29 @@ Python ceiling — a different message — and the test fails). No-PyAV reformat
 tests keep the Python invariant in the core suite; fail-closed and viewer-resize
 have their own regressions. All revert-proven.
 
-**A6 — TLS 1.3 channel-binding construction: CLOSED (as far as the runtime
-allows), handshake no longer frozen.** The auth handshake now NEGOTIATES the
-channel-binding construction and binds the chosen TYPE into the signed transcript.
-It PREFERS RFC 9266 tls-exporter whenever the runtime can produce it (CPython
-3.13+ exposes it via get_channel_binding); on the 3.11.x MVP target the stdlib
-only offers tls-unique (CHANNEL_BINDING_TYPES == ["tls-unique"]; export_keying_material
-is not exposed until 3.13), so it falls back to tls-unique and logs a clear warning
-on TLS 1.3. Because the binding TYPE is part of the transcript, the wire is explicit
-and upgradeable — moving the rig to a tls-exporter-capable runtime upgrades both
-ends automatically with no protocol change, and a peer using a different
-construction fails verification (belt-and-suspenders: explicit type check AND
-cryptographic transcript binding, revert-proven with both removed). Relay-MITM
-defense re-verified end to end. NOTE: fully standards-clean tls-exporter on the
-target requires either Python 3.13+ or adopting pyOpenSSL for the transport; both
-are runtime/dependency decisions deferred out of the LAN MVP, and the negotiated
-design means neither is a wire-breaking change when adopted.
+**A6 — TLS 1.3 channel-binding construction: OPEN (handshake no longer frozen,
+but NOT standards-clean on any current CPython).** The auth handshake now selects
+the channel-binding construction and binds the chosen TYPE into the signed
+transcript. It is written to PREFER RFC 9266 tls-exporter whenever the runtime can
+produce it — but CORRECTION: no released CPython currently exposes tls-exporter.
+Verified on Python 3.13.5, `ssl.CHANNEL_BINDING_TYPES == ["tls-unique"]`, and the
+3.14 docs still list only tls-unique; `export_keying_material` is likewise not
+exposed. So on every current runtime (including 3.11.x MVP target and 3.13) the
+code falls back to tls-unique and logs a warning on TLS 1.3 — which RFC 9266 says
+is NOT defined for TLS 1.3. tls-unique remains functional (CPython computes it from
+the Finished MAC, unique per connection) but is not the standards-mandated binding.
+
+Because the binding TYPE is in the transcript, the wire is explicit and upgradeable:
+a peer using a different construction fails verification (belt-and-suspenders:
+explicit type check AND transcript binding, revert-proven), and adopting a
+tls-exporter-capable path later is not a wire break. But this is NOT true
+negotiation — each endpoint selects its strongest LOCAL binding and requires an
+exact peer match (fail-closed compatibility, not a downgrade-resistant common-
+capability exchange). Getting a real tls-exporter requires pyOpenSSL
+(`Connection.export_keying_material`) or a future CPython that exposes it; both are
+deferred. **A6 stays OPEN, and per the accepted B5 gate, network-driven injection
+stays disabled until A6 closes** — the input-layer nonce/sequence defence (INV-12)
+does NOT substitute for A6.
 
 **Transport wire-version note.** `_TAG_VIDEO=2` is a transport-framing change
 below the JSON envelope version, so `PROTOCOL_VERSION` can't detect a mismatch —

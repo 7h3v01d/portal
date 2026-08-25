@@ -2,23 +2,28 @@
 # Copyright 2026 Leon Priest (github.com/7h3v01d)
 """Adversarial tests for the ownership ledger — INV-13.
 
-Central property: the ledger commit is atomic with the OS submission (both inside
-the gate critical section), so revocation can never observe a button that was
-submitted DOWN but not yet recorded. Plus the DOWN/UP legality rules and the fatal
-partial-submission handling."""
+Covers: DOWN/UP legality, atomic commit-with-submit (no stuck button under a
+teardown race), failed-release preservation, and the in-gate duplicate-DOWN race."""
 
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
 
 from portal.input.gate import InjectionGate
 from portal.input.ledger import (
     AmbiguousSubmission, FakeInputBackend, InjectionError, OwnershipLedger,
+    legal_button_transition,
 )
-from portal.input.model import MouseButton
+from portal.input.model import (
+    InputEvent, InputKind, MouseButton, SessionRef, ViewRef, new_session_nonce,
+)
+
+
+def _button_event(button, pressed):
+    return InputEvent(kind=InputKind.BUTTON, button=button, pressed=pressed,
+                      session=SessionRef(new_session_nonce(), 1), view=ViewRef(0, 0))
 
 
 def test_down_then_up_tracked():
@@ -47,36 +52,61 @@ def test_release_all_emits_up_for_owned_only():
     led.commit_button(MouseButton.LEFT, True)
     led.commit_button(MouseButton.X1, True)
     released = []
-    out = led.release_all(lambda b: released.append(b))
-    assert set(out) == {MouseButton.LEFT, MouseButton.X1}
-    assert set(released) == {MouseButton.LEFT, MouseButton.X1}
+    result = led.release_all(lambda b: released.append(b))
+    assert result.released == frozenset({MouseButton.LEFT, MouseButton.X1})
+    assert result.clean
     assert led.owned == frozenset()
 
 
+def test_failed_release_keeps_button_owned():
+    # INV-13: a failed safety release must NOT be forgotten — the button stays
+    # owned and the failure is surfaced, so Portal never loses the fact that an
+    # input may still be physically DOWN.
+    led = OwnershipLedger()
+    led.commit_button(MouseButton.LEFT, True)
+    led.commit_button(MouseButton.RIGHT, True)
+
+    def emit_up(b):
+        if b is MouseButton.LEFT:
+            raise RuntimeError("simulated release failure")
+
+    result = led.release_all(emit_up)
+    assert MouseButton.LEFT in result.failed
+    assert MouseButton.RIGHT in result.released
+    assert not result.clean
+    # LEFT must remain owned; RIGHT was released.
+    assert led.owns(MouseButton.LEFT)
+    assert not led.owns(MouseButton.RIGHT)
+
+
+def test_partial_submission_is_fatal():
+    backend = FakeInputBackend()
+    backend.ambiguous_next = True
+    with pytest.raises(AmbiguousSubmission):
+        backend.button(MouseButton.LEFT, True)
+
+
 def test_ledger_commit_atomic_with_teardown_no_stuck_button():
-    # INV-13 atomicity, the REAL harm: the kill path closes the gate AND runs
-    # teardown (release_all) which may land in the window between a backend DOWN
-    # submission and its ledger commit. If the commit is atomic with the submit
-    # (both inside the gate critical section), teardown either sees the button
-    # (releases it) or the submit never ran (nothing pressed) — never a stuck
-    # button. We detect a stuck button as a backend DOWN with no matching UP.
+    # INV-13 atomicity: kill-time teardown may land in the window between a backend
+    # DOWN and its ledger commit. If commit is atomic with submit (both inside the
+    # gate critical section), teardown either sees the button (releases it) or the
+    # submit never ran — never a stuck button. Assert no button owned right after
+    # the kill teardown (no rescuing final teardown).
     stuck_seen = False
     for _ in range(200):
         gate = InjectionGate()
-        gate.open()
         backend = FakeInputBackend()
         led = OwnershipLedger()
 
         def do_press():
             def cs():
-                backend.button(MouseButton.LEFT, True)     # OS submission
-                led.commit_button(MouseButton.LEFT, True)  # ledger commit — ATOMIC
+                backend.button(MouseButton.LEFT, True)
+                led.commit_button(MouseButton.LEFT, True)
                 return True
             gate.submit(cs)
 
         def do_kill():
             gate.close()
-            # Teardown releases owned buttons via the backend (best-effort).
             led.release_all(lambda b: backend.button(b, False))
 
         tp = threading.Thread(target=do_press)
@@ -84,11 +114,6 @@ def test_ledger_commit_atomic_with_teardown_no_stuck_button():
         tp.start(); tk.start()
         tp.join(); tk.join()
 
-        # The kill path already ran its teardown. With an ATOMIC commit, the
-        # ledger must now be EMPTY: either the press ran fully before teardown
-        # (which then released the button) or the gate closed first (press
-        # dropped, nothing pressed). There is NO rescuing teardown here — a button
-        # still owned now is a genuinely stuck button.
         if led.owned != frozenset():
             stuck_seen = True
             break
@@ -100,9 +125,37 @@ def test_ledger_commit_atomic_with_teardown_no_stuck_button():
     assert not stuck_seen, "a LEFT DOWN was left without a matching UP — stuck button (INV-13)"
 
 
+def test_duplicate_down_race_single_os_submission():
+    # INV-13: two simultaneous LEFT_DOWN requests must result in EXACTLY ONE
+    # backend LEFT_DOWN. The legality check must be INSIDE the gate critical
+    # section (before the backend call), not a pre-check outside it, or both
+    # workers observe "not owned" and both submit. A Barrier aligns both threads
+    # so the race is forced, not left to chance.
+    for _ in range(20):
+        gate = InjectionGate()
+        backend = FakeInputBackend()
+        backend.delay = 0.01  # slow submission so a pre-check outside the gate
+        #                       lands during another worker's in-flight submit
+        led = OwnershipLedger()
+        barrier = threading.Barrier(2)
 
-def test_partial_submission_is_fatal():
-    backend = FakeInputBackend()
-    backend.ambiguous_next = True
-    with pytest.raises(AmbiguousSubmission):
-        backend.button(MouseButton.LEFT, True)
+        def press():
+            barrier.wait()  # both threads arrive together, maximising interleave
+            def cs():
+                # Legality check INSIDE the critical section, before the backend.
+                if not legal_button_transition(led, _button_event(MouseButton.LEFT, True)):
+                    return False
+                backend.button(MouseButton.LEFT, True)
+                led.commit_button(MouseButton.LEFT, True)
+                return True
+            return gate.submit(cs)
+
+        threads = [threading.Thread(target=press) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        downs = sum(1 for c in backend.calls if c.detail == "left:down")
+        assert downs == 1, f"expected exactly 1 backend LEFT_DOWN, got {downs}"
+        assert led.owns(MouseButton.LEFT)
