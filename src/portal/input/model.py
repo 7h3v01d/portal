@@ -46,6 +46,15 @@ class ViewRef:
     view_epoch: int
     frame_seq: int
 
+    def __post_init__(self):
+        if type(self.view_epoch) is not int or type(self.frame_seq) is not int:
+            raise ValueError("view_epoch and frame_seq must be ints")
+        if self.view_epoch < 0 or self.frame_seq < 0:
+            raise ValueError("view_epoch and frame_seq must be non-negative")
+
+
+_UINT64_MAX = 2**64 - 1
+
 
 @dataclass(frozen=True)
 class SessionRef:
@@ -58,8 +67,10 @@ class SessionRef:
     def __post_init__(self):
         if len(self.input_session_nonce) != 16:
             raise ValueError("input_session_nonce must be exactly 16 bytes (128 bits)")
-        if self.input_seq < 0:
-            raise ValueError("input_seq must be non-negative")
+        if type(self.input_seq) is not int:
+            raise ValueError("input_seq must be an int")
+        if not (0 <= self.input_seq <= _UINT64_MAX):
+            raise ValueError(f"input_seq must be a uint64 (0..2^64-1), got {self.input_seq}")
 
 
 def new_session_nonce() -> bytes:
@@ -93,6 +104,10 @@ class InputEvent:
         if self.kind is InputKind.MOVE:
             if self.display_id is None or self.x is None or self.y is None:
                 raise ValueError("MOVE requires display_id, x, y")
+            if not isinstance(self.display_id, str) or self.display_id == "":
+                raise ValueError("display_id must be a non-empty string")
+            if type(self.x) not in (int, float) or type(self.y) not in (int, float):
+                raise ValueError("coordinates must be numeric")
             if not (0.0 <= self.x <= 1.0) or not (0.0 <= self.y <= 1.0):
                 raise ValueError(f"coordinates out of range: ({self.x}, {self.y})")
             if self.button is not None or self.wheel_delta is not None:
@@ -100,11 +115,17 @@ class InputEvent:
         elif self.kind is InputKind.BUTTON:
             if self.button is None or self.pressed is None:
                 raise ValueError("BUTTON requires button and pressed")
+            if type(self.pressed) is not bool:
+                raise ValueError("pressed must be exactly a bool")
+            if not isinstance(self.button, MouseButton):
+                raise ValueError("button must be a MouseButton")
             if self.x is not None or self.y is not None or self.wheel_delta is not None:
                 raise ValueError("BUTTON must not carry move/wheel fields")
         elif self.kind is InputKind.WHEEL:
             if self.wheel_delta is None:
                 raise ValueError("WHEEL requires wheel_delta")
+            if type(self.wheel_delta) is not int:
+                raise ValueError("wheel_delta must be exactly an int")
             if self.button is not None or self.x is not None or self.y is not None:
                 raise ValueError("WHEEL must not carry move/button fields")
         else:  # pragma: no cover - enum is exhaustive

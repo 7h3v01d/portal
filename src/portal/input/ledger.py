@@ -24,7 +24,7 @@ the fatal-condition handling without any OS.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..common.errors import PortalError
 from .model import InputEvent, InputKind, MouseButton
@@ -55,8 +55,12 @@ class FakeInputBackend:
         self.calls: list[_Submission] = []
         self.fail_next = False
         self.ambiguous_next = False  # simulate return != 1 (partial/ambiguous)
+        self.delay = 0.0  # optional per-call delay to widen races in tests
 
     def _check_faults(self) -> None:
+        if self.delay:
+            import time
+            time.sleep(self.delay)
         if self.fail_next:
             self.fail_next = False
             raise InjectionError("simulated backend failure")
@@ -80,11 +84,23 @@ class FakeInputBackend:
         return 1
 
 
+@dataclass(frozen=True)
+class ReleaseResult:
+    """Outcome of a teardown release. `failed` buttons remain owned (Portal must
+    assume they may still be physically DOWN) — INV-13 exists precisely so this
+    state is never silently lost."""
+    released: frozenset
+    failed: frozenset
+
+    @property
+    def clean(self) -> bool:
+        return len(self.failed) == 0
+
+
 class OwnershipLedger:
-    """Tracks buttons Portal currently holds DOWN. Not thread-safe on its own — it
-    is only ever mutated inside the InjectionGate critical section, which provides
-    the serialization (INV-13). A dedicated lock guards teardown, which may be
-    invoked from the revocation path."""
+    """Tracks buttons Portal currently holds DOWN. Mutated only inside the
+    InjectionGate critical section (which serializes it, INV-13); a dedicated lock
+    additionally guards teardown, which may run from the revocation path."""
 
     def __init__(self) -> None:
         self._down: set[MouseButton] = set()
@@ -100,9 +116,9 @@ class OwnershipLedger:
             return frozenset(self._down)
 
     def commit_button(self, button: MouseButton, pressed: bool) -> None:
-        """Record a CONFIRMED button transition. Must be called only after the
-        backend confirmed exactly one submission, and only from inside the gate's
-        critical section. Enforces the DOWN/UP legality rules (INV-13)."""
+        """Record a CONFIRMED button transition. Called only after the backend
+        confirmed exactly one submission, and only from inside the gate's critical
+        section. Enforces the DOWN/UP legality rules (INV-13)."""
         with self._lock:
             if pressed:
                 if button in self._down:
@@ -113,22 +129,24 @@ class OwnershipLedger:
                     raise InjectionError(f"UP for non-owned button {button.value}")
                 self._down.discard(button)
 
-    def release_all(self, emit_up) -> list[MouseButton]:
-        """Teardown: emit UP for every owned button, then clear. `emit_up(button)`
-        performs the actual release submission (best-effort). Returns the buttons
-        released. Used on session end / revoke / kill (INV-13). Best-effort: an
-        emit failure is swallowed so one stuck button can't block releasing others."""
+    def release_all(self, emit_up) -> ReleaseResult:
+        """Teardown: emit UP for every owned button. A button is removed from the
+        ledger ONLY after its release is confirmed; a FAILED release KEEPS the
+        button owned so Portal never forgets an input may still be held (INV-13).
+        `emit_up(button)` performs the release submission and must raise on failure.
+        Returns a ReleaseResult; a non-clean result is a fatal cleanup failure the
+        caller must surface (and may retry)."""
         with self._lock:
-            to_release = list(self._down)
-            released: list[MouseButton] = []
-            for b in to_release:
+            released: set[MouseButton] = set()
+            failed: set[MouseButton] = set()
+            for b in list(self._down):
                 try:
                     emit_up(b)
-                    released.append(b)
-                except Exception:  # noqa: BLE001 — best-effort cleanup
-                    pass
-            self._down.clear()
-            return released
+                    self._down.discard(b)  # remove ONLY after confirmed release
+                    released.add(b)
+                except Exception:  # noqa: BLE001 — keep it owned, record the failure
+                    failed.add(b)
+            return ReleaseResult(frozenset(released), frozenset(failed))
 
 
 def legal_button_transition(ledger: OwnershipLedger, event: InputEvent) -> bool:

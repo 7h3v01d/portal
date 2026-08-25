@@ -31,54 +31,68 @@ backend exists.
 from __future__ import annotations
 
 import threading
-from typing import Callable, TypeVar
+from dataclasses import dataclass
+from enum import Enum
+from typing import Callable, Generic, TypeVar
 
 T = TypeVar("T")
 
 
 class InjectionGateClosed(Exception):
-    """Raised (internally) when a submission is attempted after the gate closed.
-    Callers see a dropped event, never a delivered one."""
+    """Raised when a submission is attempted after the gate closed. Callers see a
+    dropped event, never a delivered one."""
+
+
+class SubmitOutcome(str, Enum):
+    SUBMITTED = "submitted"
+    GATE_CLOSED = "gate_closed"
+
+
+@dataclass
+class SubmitResult(Generic[T]):
+    """Discriminated result of a submit — never an ambiguous None sentinel on this
+    safety boundary. `outcome` distinguishes \u201cran and returned None\u201d from
+    \u201cgate rejected it\u201d; `value` is the critical section's return when SUBMITTED."""
+    outcome: SubmitOutcome
+    value: T | None = None
+
+    @property
+    def submitted(self) -> bool:
+        return self.outcome is SubmitOutcome.SUBMITTED
 
 
 class InjectionGate:
-    """A synchronized gate establishing a total order between submit and close.
+    """A synchronized, ONE-SHOT gate establishing a total order between submit and
+    close (INV-2/INV-3). A gate goes open -> closed exactly once and can NEVER be
+    reopened: revocation/expiry kills authority, and fresh consent must create a
+    NEW gate (INV-16). This makes stale references safe — once a gate has been
+    closed, no holder of it can ever inject again.
 
-    Usage (submit side):
-        result = gate.submit(lambda: (backend.send(ev), ledger.commit(ev)))
-        # returns None if the gate was closed (event dropped), else the callable's
-        # return value.
+    Submit side:
+        res = gate.submit(lambda: (backend.button(...), ledger.commit(...)))
+        if res.submitted: ...        # res.value is the critical section's return
+        else: ...                    # SubmitOutcome.GATE_CLOSED — event dropped
 
-    Usage (kill side, from ANY thread including a Windows hotkey thread):
-        gate.close()   # synchronous, no await, no network — the linearization point
+    Kill side (any thread, incl. a Windows hotkey thread):
+        gate.close()                 # synchronous, no await, no network
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._open = False
-        # Number of submissions that actually ran their critical section while open.
+        # Lifecycle: a gate is created OPEN and can only transition to CLOSED once.
+        self._open = True
+        self._ever_closed = False
         self._submitted = 0
-        # Set once close() has run; used by tests/plumbing to assert quiescence.
-        self._closed_at_count: int | None = None
-
-    # -- lifecycle -----------------------------------------------------------
-    def open(self) -> None:
-        """Open the gate (input mode begins). Idempotent."""
-        with self._lock:
-            self._open = True
-            self._closed_at_count = None
 
     def close(self) -> int:
         """Close the gate — the revocation linearization point. Synchronous and
-        lock-guarded so it totally-orders against any in-progress submit. Returns
-        the number of submissions that had been admitted before the flip. Safe to
-        call from any thread; does NO async work and never touches the network.
-        The caller is responsible for signalling asyncio cleanup afterwards via
-        loop.call_soon_threadsafe (see emergency-stop plumbing, INV-3)."""
+        lock-guarded so it totally-orders against any in-progress submit. Terminal:
+        a closed gate is dead forever. Returns the number of submissions admitted
+        before the flip. Safe from any thread; does NO async or network work \u2014 the
+        caller signals asyncio cleanup afterwards via loop.call_soon_threadsafe."""
         with self._lock:
             self._open = False
-            if self._closed_at_count is None:
-                self._closed_at_count = self._submitted
+            self._ever_closed = True
             return self._submitted
 
     @property
@@ -86,25 +100,28 @@ class InjectionGate:
         with self._lock:
             return self._open
 
-    # -- submit --------------------------------------------------------------
-    def submit(self, critical_section: Callable[[], T]) -> T | None:
-        """Run `critical_section` iff the gate is open, atomically with respect to
-        close(). The callable MUST contain the whole irreversible unit — the final
-        authority re-check, the OS submission, and the ownership-ledger commit —
-        so all of it linearizes on the same lock (INV-2, INV-13). Returns the
-        callable's result, or None if the gate was closed (event dropped).
+    @property
+    def ever_closed(self) -> bool:
+        with self._lock:
+            return self._ever_closed
 
-        No await, no I/O wait, and nothing that can block indefinitely may appear
-        inside `critical_section`: it holds the injection lock that the kill path
-        needs, so a stall here would delay emergency stop."""
+    def submit(self, critical_section: Callable[[], T]) -> SubmitResult[T]:
+        """Run `critical_section` iff the gate is open, atomically with respect to
+        close(). The callable MUST contain the whole irreversible unit \u2014 the final
+        authority re-check, any legality check, the OS submission, and the
+        ownership-ledger commit \u2014 so all of it linearizes on the same lock
+        (INV-2, INV-13). Returns a discriminated SubmitResult.
+
+        Nothing inside `critical_section` may await or block indefinitely: it holds
+        the injection lock the kill path needs, so a stall would delay emergency
+        stop."""
         with self._lock:
             if not self._open:
-                return None
-            result = critical_section()
+                return SubmitResult(SubmitOutcome.GATE_CLOSED)
+            value = critical_section()
             self._submitted += 1
-            return result
+            return SubmitResult(SubmitOutcome.SUBMITTED, value)
 
-    # -- introspection for tests/plumbing ------------------------------------
     @property
     def submitted_count(self) -> int:
         with self._lock:

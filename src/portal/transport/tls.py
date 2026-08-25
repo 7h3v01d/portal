@@ -243,15 +243,20 @@ def _drain(queue: "asyncio.Queue") -> None:
 def _select_channel_binding(ssl_obj) -> tuple[str, bytes]:
     """Choose the strongest available channel binding for THIS connection.
 
-    RFC 9266 defines `tls-exporter` as the channel binding for TLS 1.3 and
-    deprecates `tls-unique` there. We PREFER tls-exporter whenever the runtime can
-    produce it (CPython 3.13+ exposes it via get_channel_binding); otherwise we
-    fall back to tls-unique, which CPython still computes for TLS 1.3 as the
-    Finished MAC — functional and unique per connection, but not standardised, so
-    we log a warning. Binding the chosen TYPE into the signed transcript (see
-    handshake.py) keeps the construction explicit and upgradeable rather than
-    silently frozen: the day the rig moves to a runtime with tls-exporter, both
-    peers negotiate to it with no wire change beyond the already-present type."""
+    RFC 9266 defines `tls-exporter` as the channel binding for TLS 1.3 and does not
+    define `tls-unique` there. We PREFER tls-exporter whenever the runtime can
+    produce it — but NOTE: no released CPython currently exposes it (verified on
+    3.13.5: ssl.CHANNEL_BINDING_TYPES == ['tls-unique']; export_keying_material is
+    not exposed either). So today this always falls back to tls-unique, which
+    CPython still computes for TLS 1.3 as the Finished MAC — functional and unique
+    per connection, but NOT the standards-mandated binding, so we log a warning.
+
+    This is NOT negotiation: each endpoint selects its strongest LOCAL binding and
+    the handshake requires an EXACT peer-type match (a mismatch fails closed). The
+    chosen TYPE is bound into the signed transcript (handshake.py), so the wire is
+    explicit and upgradeable — adopting a tls-exporter-capable path later (pyOpenSSL
+    or a future CPython) is not a wire break. A6 remains OPEN until that path
+    exists; network-driven input stays disabled meanwhile (B5)."""
     available = getattr(ssl, "CHANNEL_BINDING_TYPES", ("tls-unique",))
     if "tls-exporter" in available:
         value = ssl_obj.get_channel_binding("tls-exporter")
