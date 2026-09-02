@@ -111,3 +111,25 @@ def test_owned_release_detection():
                       session=_sess(), view=_view())
     assert up.is_owned_release()
     assert not down.is_owned_release()
+
+
+def test_nonce_must_be_bytes_not_str():
+    import pytest
+    with pytest.raises(ValueError):
+        SessionRef("abcdefghijklmnop", 0)  # 16 chars but str, not bytes
+
+
+def test_event_session_must_be_sessionref():
+    import pytest
+    ev = InputEvent(kind=InputKind.MOVE, display_id="d", x=0.5, y=0.5,
+                    session="oops", view=ViewRef(0, 0))
+    with pytest.raises(ValueError):
+        ev.validate_shape()
+
+
+def test_event_view_must_be_viewref():
+    import pytest
+    ev = InputEvent(kind=InputKind.MOVE, display_id="d", x=0.5, y=0.5,
+                    session=SessionRef(new_session_nonce(), 0), view="oops")
+    with pytest.raises(ValueError):
+        ev.validate_shape()

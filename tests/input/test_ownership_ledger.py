@@ -52,7 +52,7 @@ def test_release_all_emits_up_for_owned_only():
     led.commit_button(MouseButton.LEFT, True)
     led.commit_button(MouseButton.X1, True)
     released = []
-    result = led.release_all(lambda b: released.append(b))
+    result = led.release_all(lambda b: (released.append(b), 1)[1])
     assert result.released == frozenset({MouseButton.LEFT, MouseButton.X1})
     assert result.clean
     assert led.owned == frozenset()
@@ -69,6 +69,7 @@ def test_failed_release_keeps_button_owned():
     def emit_up(b):
         if b is MouseButton.LEFT:
             raise RuntimeError("simulated release failure")
+        return 1
 
     result = led.release_all(emit_up)
     assert MouseButton.LEFT in result.failed
