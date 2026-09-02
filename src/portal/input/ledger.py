@@ -40,6 +40,15 @@ class AmbiguousSubmission(InjectionError):
     best-effort owned-release cleanup."""
 
 
+def require_single_submission(count: int) -> None:
+    """Enforce the confirmed-submission rule (INV-13): one logical transition must
+    yield exactly one OS submission. Any other count is ambiguous/partial and
+    FATAL. This is the single choke point — MOVE/BUTTON/WHEEL and teardown release
+    all pass their backend return through here BEFORE committing any state."""
+    if count != 1:
+        raise AmbiguousSubmission(f"backend confirmed {count} submissions; expected exactly 1")
+
+
 @dataclass
 class _Submission:
     kind: str
@@ -133,7 +142,9 @@ class OwnershipLedger:
         """Teardown: emit UP for every owned button. A button is removed from the
         ledger ONLY after its release is confirmed; a FAILED release KEEPS the
         button owned so Portal never forgets an input may still be held (INV-13).
-        `emit_up(button)` performs the release submission and must raise on failure.
+        `emit_up(button)` performs the release submission and MUST return the
+        confirmed submission count (must be 1); 0 or 2 is treated as a failed
+        (ambiguous) release and the button stays owned.
         Returns a ReleaseResult; a non-clean result is a fatal cleanup failure the
         caller must surface (and may retry)."""
         with self._lock:
@@ -141,8 +152,9 @@ class OwnershipLedger:
             failed: set[MouseButton] = set()
             for b in list(self._down):
                 try:
-                    emit_up(b)
-                    self._down.discard(b)  # remove ONLY after confirmed release
+                    count = emit_up(b)
+                    require_single_submission(count)  # 0 or 2 -> AmbiguousSubmission
+                    self._down.discard(b)  # remove ONLY after a CONFIRMED release
                     released.add(b)
                 except Exception:  # noqa: BLE001 — keep it owned, record the failure
                     failed.add(b)

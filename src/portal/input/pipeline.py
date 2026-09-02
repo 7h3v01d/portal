@@ -29,7 +29,9 @@ from enum import Enum
 from typing import Callable
 
 from .gate import InjectionGate, SubmitOutcome
-from .ledger import OwnershipLedger, legal_button_transition
+from .ledger import (
+    AmbiguousSubmission, OwnershipLedger, legal_button_transition, require_single_submission,
+)
 from .model import InputEvent, InputKind
 from .policy import AuthorityTTL, ClassAwareRateLimiter, PhysicalActivityGate
 from .sequence import SessionSequenceGuard
@@ -68,6 +70,7 @@ class InputIntakePipeline:
         ttl: AuthorityTTL,
         physical: PhysicalActivityGate,
         rate: ClassAwareRateLimiter,
+        token=None,
         on_revoke: "Callable[[str], None] | None" = None,
     ) -> None:
         self._gate = gate
@@ -78,12 +81,18 @@ class InputIntakePipeline:
         self._ttl = ttl
         self._physical = physical
         self._rate = rate
+        # The live capability token (INPUT_INJECT_MOUSE). Re-checked INSIDE the gate
+        # critical section before every backend submission — the A2/B5 pattern. TTL
+        # is NOT a substitute for this: a revoked capability must stop injection
+        # even if the TTL hasn't expired.
+        self._token = token
         # Called when the pipeline decides the session must END (not just pause):
-        # sustained physical activity (INV-15) or authority expiry (INV-16). The
-        # host wires this to tear the session down. The pipeline closes the gate
-        # itself and calls this at most once.
+        # sustained physical activity (INV-15), authority expiry (INV-16), or a
+        # FATAL ambiguous submission (T-13). The host wires this to tear down.
         self._on_revoke = on_revoke
         self._revoked = False
+        self._fatal = False  # ambiguous submission: refuse everything thereafter
+        self._release_result = None
 
     def _revoke(self, reason: str) -> None:
         if self._revoked:
@@ -92,16 +101,29 @@ class InputIntakePipeline:
         self._gate.close()  # no further authority-bearing event can be submitted
         # INV-13: releasing owned buttons is a SAFETY action, permitted after the
         # gate closes. Emit UP for everything Portal holds DOWN so revocation never
-        # leaves a stuck button. A failed release keeps the button owned (recorded
-        # in the ReleaseResult) so the session-end path can retry.
+        # leaves a stuck button. release_all enforces confirmed-submission, so a
+        # failed/ambiguous release keeps the button owned (recorded in the result).
         self._release_result = self._ledger.release_all(
             lambda b: self._backend.button(b, False)
         )
         if self._on_revoke is not None:
             self._on_revoke(reason)
 
+    def suspend_view(self, reason: str = "view_transition"):
+        """Called by the host on a view-context transition (focus/geometry/topology
+        change): proactively release every owned button BEFORE bumping the epoch and
+        waiting for a fresh frame, so a drag never survives a visual discontinuity
+        and no held button is left stuck when old-epoch releases would be rejected
+        (INV-10 x INV-13). Returns the ReleaseResult. Does NOT revoke the session —
+        control resumes once a fresh frame arrives; it only clears held state."""
+        result = self._ledger.release_all(lambda b: self._backend.button(b, False))
+        self._views.bump_epoch()
+        return result
+
     def handle(self, event: InputEvent) -> IntakeResult:
-        # If already revoked, nothing more is accepted (the gate is closed too).
+        # If already revoked or fatally stopped, nothing more is accepted.
+        if self._fatal:
+            return IntakeResult(False, Stage.GATE, "fatal")
         if self._revoked:
             return IntakeResult(False, Stage.GATE, "revoked")
 
@@ -126,10 +148,22 @@ class InputIntakePipeline:
         if not sres.accepted:
             return IntakeResult(False, Stage.SEQUENCE, sres.verdict.value)
 
-        # 3. View freshness (INV-10).
-        vres = self._views.check(event.view)
-        if not vres.accepted:
-            return IntakeResult(False, Stage.VIEW, vres.verdict.value)
+        # Determine owned-release early: an UP for a button Portal currently holds
+        # is a SAFETY event and must not be dropped by view/pause/rate policy, or a
+        # held button could be left stuck (INV-13 vs INV-10/5/15 composition).
+        owned_release = event.is_owned_release() and (
+            event.button is not None and self._ledger.owns(event.button)
+        )
+
+        # 3. View freshness (INV-10) — EXCEPT an owned safety-release, which must be
+        #    allowed to release a held button even against a stale view (a drag must
+        #    not survive a visual-context discontinuity, but neither may the release
+        #    be dropped). Epoch bumps also proactively release owned buttons (see
+        #    suspend_view), so this is defence in depth.
+        if not owned_release:
+            vres = self._views.check(event.view)
+            if not vres.accepted:
+                return IntakeResult(False, Stage.VIEW, vres.verdict.value)
 
         # 4. Authority TTL (INV-16). Expiry ENDS the session (revoke), not merely
         #    drops this event.
@@ -138,15 +172,10 @@ class InputIntakePipeline:
             return IntakeResult(False, Stage.TTL, "expired")
 
         # 5. Physical-user precedence (INV-15). Sustained physical activity ENDS the
-        #    session; a shorter burst only pauses. An owned-release must still reach
+        #    session; a shorter burst only pauses. An owned-release still reaches
         #    the gate so a held button is released rather than left stuck.
-        owned_release = event.is_owned_release() and (
-            event.button is not None and self._ledger.owns(event.button)
-        )
         if self._physical.wants_revoke():
             self._revoke("physical_takeover")
-            # Still let an owned-release through the (now closed) gate? No — the gate
-            # is closed; teardown/owned-release is the session-end path's job. Drop.
             return IntakeResult(False, Stage.PHYSICAL, "physical_takeover")
         if self._physical.is_paused() and not owned_release:
             return IntakeResult(False, Stage.PHYSICAL, "paused")
@@ -155,28 +184,44 @@ class InputIntakePipeline:
         if not self._rate.allow(event, owned_release):
             return IntakeResult(False, Stage.RATE, "rate_limited")
 
-        # 7. Injection gate + ledger, one atomic critical section (INV-2/13).
+        # 7. Injection gate + ledger, one atomic critical section (INV-2/13). The
+        #    live capability token is re-checked HERE, inside the lock, right before
+        #    the irreversible submission — the A2/B5 pattern. Backend submissions
+        #    are confirmed (exactly 1) before any ledger commit; an ambiguous count
+        #    raises AmbiguousSubmission, caught below as a FATAL session condition.
         def critical_section():
-            # Button legality re-checked INSIDE the lock (INV-13 — the duplicate
-            # DOWN race). Non-button events skip this.
+            if self._token is not None and not self._token.valid:
+                return ("revoked", None)  # capability died before the submission
             if event.kind is InputKind.BUTTON:
                 if not legal_button_transition(self._ledger, event):
                     return ("illegal", None)
-                self._backend.button(event.button, event.pressed)
+                require_single_submission(self._backend.button(event.button, event.pressed))
                 self._ledger.commit_button(event.button, event.pressed)
                 return ("ok", None)
             if event.kind is InputKind.MOVE:
-                self._backend.move(event.x, event.y, event.display_id)
+                require_single_submission(self._backend.move(event.x, event.y, event.display_id))
                 return ("ok", None)
             if event.kind is InputKind.WHEEL:
-                self._backend.wheel(event.wheel_delta)
+                require_single_submission(self._backend.wheel(event.wheel_delta))
                 return ("ok", None)
             return ("unknown", None)
 
-        result = self._gate.submit(critical_section)
+        try:
+            result = self._gate.submit(critical_section)
+        except AmbiguousSubmission as exc:
+            # T-13: ambiguous/partial OS submission is FATAL. Stop all injection,
+            # revoke the session, best-effort release owned state, refuse forever.
+            self._fatal = True
+            self._revoke("ambiguous_submission")
+            return IntakeResult(False, Stage.GATE, f"fatal:{exc}")
+
         if result.outcome is SubmitOutcome.GATE_CLOSED:
             return IntakeResult(False, Stage.GATE, "gate_closed")
         status, _ = result.value
+        if status == "revoked":
+            # The capability was revoked between the policy checks and the lock.
+            self._revoke("capability_revoked")
+            return IntakeResult(False, Stage.GATE, "capability_revoked")
         if status != "ok":
             return IntakeResult(False, Stage.LEGALITY, status)
 

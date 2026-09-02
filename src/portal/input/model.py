@@ -65,6 +65,8 @@ class SessionRef:
     input_seq: int
 
     def __post_init__(self):
+        if type(self.input_session_nonce) is not bytes:
+            raise ValueError("input_session_nonce must be bytes")
         if len(self.input_session_nonce) != 16:
             raise ValueError("input_session_nonce must be exactly 16 bytes (128 bits)")
         if type(self.input_seq) is not int:
@@ -101,6 +103,10 @@ class InputEvent:
         """Structural validation only — INV-6 coordinate bounds and per-kind field
         presence. Raises ValueError on a malformed event. Authority, view freshness,
         rate, and session-sequence checks live in the gate/policy, not here."""
+        if not isinstance(self.session, SessionRef):
+            raise ValueError("session must be a SessionRef")
+        if not isinstance(self.view, ViewRef):
+            raise ValueError("view must be a ViewRef")
         if self.kind is InputKind.MOVE:
             if self.display_id is None or self.x is None or self.y is None:
                 raise ValueError("MOVE requires display_id, x, y")

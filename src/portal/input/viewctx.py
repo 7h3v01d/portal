@@ -80,14 +80,18 @@ class ViewContextRegistry:
         self._frames.clear()
         return self._epoch
 
-    def register_frame(self) -> ViewRef:
+    def register_frame(self, captured_at: float | None = None) -> ViewRef:
         """Stamp a newly displayed frame with the current epoch and a fresh
-        frame_seq, recording its capture time. Returns the ViewRef the host will
-        send alongside the frame for the controller to echo back on inputs."""
+        frame_seq, recording its CAPTURE time. `captured_at` is the monotonic
+        timestamp from the capture pipeline (when the pixels were grabbed) — NOT
+        when this registry happened to see the frame, which could be seconds later
+        behind an encode/network backlog (INV-10). Falls back to now() only when a
+        capture time isn't supplied (e.g. synthetic frames in tests)."""
         seq = self._next_frame_seq
         self._next_frame_seq += 1
         now = self._clock()
-        self._frames[seq] = now
+        cap_t = captured_at if captured_at is not None else now
+        self._frames[seq] = cap_t
         # Evict by AGE first: any frame older than max_age can never pass check()
         # anyway (TOO_OLD), so dropping it loses nothing. This ensures a still-valid
         # (within max_age) recent frame is NEVER evicted just to satisfy the count
